@@ -1,0 +1,3 @@
+[target.'cfg(target_os = "macos")']
+# Compress generic parser symbols so they fit the Mach-O linker symbol limit.
+rustflags = ["-C", "symbol-mangling-version=v0"]

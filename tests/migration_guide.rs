@@ -22,12 +22,21 @@
 //
 // STATEがプロセス全体で1つなので、全サンプルを1つのテスト関数で直列に実行する。
 
+#[cfg(windows)]
 use std::ffi::c_long;
+#[cfg(target_os = "macos")]
+#[allow(non_camel_case_types)]
+type c_long = i32;
+#[cfg(target_os = "macos")]
+type HGLOBAL = *mut std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use encoding_rs::SHIFT_JIS;
+#[cfg(windows)]
 use winapi::shared::minwindef::HGLOBAL;
+#[cfg(windows)]
 use winapi::um::winbase::{GlobalAlloc, GlobalFree, GMEM_FIXED};
 
 const CONF: &str = "[characters]\n\"湊\" = \"\\\\0\"\n\"助手\" = \"\\\\1\"\n";
@@ -35,7 +44,10 @@ const GET_PROPERTY_SUFFIX_HEAD: &str = "\\![get,property,OnGotVirtualTime,";
 
 fn alloc(bytes: &[u8]) -> HGLOBAL {
     unsafe {
+        #[cfg(windows)]
         let mem = GlobalAlloc(GMEM_FIXED, bytes.len() + 1);
+        #[cfg(target_os = "macos")]
+        let mem = libc::malloc(bytes.len() + 1);
         let p = mem as *mut u8;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         *p.add(bytes.len()) = 0;
@@ -55,7 +67,10 @@ fn send(id: &str, refs: &[String]) -> String {
         req.push_str(&format!("Reference{}: {}\r\n", i, r));
     }
     req.push_str("\r\n");
+    #[cfg(windows)]
     let (enc, _, _) = SHIFT_JIS.encode(&req);
+    #[cfg(target_os = "macos")]
+    let enc = req.replace("Charset: Shift_JIS", "Charset: UTF-8").into_bytes();
     let h = alloc(&enc);
     let mut len = enc.len() as c_long;
     let out = minato::request(h, &mut len);
@@ -63,8 +78,10 @@ fn send(id: &str, refs: &[String]) -> String {
         return "<null>".to_string();
     }
     let bytes = unsafe { std::slice::from_raw_parts(out as *const u8, len as usize) }.to_vec();
-    unsafe { GlobalFree(out) };
-    SHIFT_JIS.decode(&bytes).0.into_owned()
+    #[cfg(windows)]
+    { unsafe { GlobalFree(out) }; SHIFT_JIS.decode(&bytes).0.into_owned() }
+    #[cfg(target_os = "macos")]
+    { unsafe { libc::free(out) }; String::from_utf8(bytes).unwrap() }
 }
 
 /// 応答からValueを取り出す。204は「(204)」。
@@ -145,6 +162,21 @@ fn extract_samples(path: &Path) -> Vec<Sample> {
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {
                 expected.push(lines[i].to_string());
                 i += 1;
+            }
+            // An optional platform-specific output follows the Windows example.
+            let mut alternate = i + 1;
+            while alternate < lines.len() && lines[alternate].trim().is_empty() { alternate += 1; }
+            if lines.get(alternate).map(|s| s.trim()) == Some("<!--macos-->") {
+                alternate += 1;
+                assert_eq!(lines[alternate].trim(), "```text");
+                alternate += 1;
+                let mut macos = Vec::new();
+                while alternate < lines.len() && lines[alternate].trim() != "```" {
+                    macos.push(lines[alternate].to_string());
+                    alternate += 1;
+                }
+                if cfg!(target_os = "macos") { expected = macos; }
+                i = alternate;
             }
             out.push(Sample {
                 file: path.file_name().unwrap().to_string_lossy().to_string(),

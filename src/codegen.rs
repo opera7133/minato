@@ -4109,7 +4109,11 @@ OnRandomTalk if(false) => {
 
         // 開発者モードでないと権限エラーになる。
         // 環境依存なので、作れなかったときは検証せずに抜ける。
-        if std::os::windows::fs::symlink_file(&target, master.join("link.txt")).is_err() {
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&target, master.join("link.txt"));
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&target, master.join("link.txt"));
+        if link_result.is_err() {
             eprintln!("シンボリックリンクを作成できないためスキップ（開発者モードを確認）");
             return;
         }

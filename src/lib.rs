@@ -8,7 +8,15 @@ pub mod parser;
 mod codegen;
 mod config;
 mod runtime;
+#[cfg(windows)]
 mod saori;
+#[cfg(target_os = "macos")]
+#[path = "saori_macos.rs"]
+mod saori;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{load, loadu, request, unload};
 pub mod analyzer;
 
 use std::collections::{HashMap, HashSet};
@@ -24,7 +32,9 @@ use crate::codegen::Value;
 use config::Config;
 use parser::{load_program, Talk, LoadError, Stmt, Spanned};
 
+#[cfg(windows)]
 use winapi::um::winbase::{GlobalAlloc, GlobalFree, GMEM_FIXED};
+#[cfg(windows)]
 use winapi::shared::minwindef::HGLOBAL;
 use crate::analyzer::Analyzer;
 
@@ -86,6 +96,7 @@ fn safe_len(len: c_long) -> usize {
 // ② append_log 関数の直後に以下を追加
 // ═══════════════════════════════════════════════════════════
 
+#[cfg(windows)]
 #[no_mangle]
 pub extern "C" fn loadu(h: HGLOBAL, len: c_long) -> i32 {
     append_log!(format!("loadu start"));
@@ -149,6 +160,7 @@ pub extern "C" fn loadu(h: HGLOBAL, len: c_long) -> i32 {
     })
 }
 
+#[cfg(windows)]
 #[no_mangle]
 pub extern "C" fn load(h: HGLOBAL, len: c_long) -> i32 {
     append_log!(format!("load called"));
@@ -193,6 +205,7 @@ pub extern "C" fn load(h: HGLOBAL, len: c_long) -> i32 {
 }
 
 // unload() から drain ブロックを削除
+#[cfg(windows)]
 #[no_mangle]
 pub extern "C" fn unload() -> i32 {
     std::panic::catch_unwind(|| {
@@ -215,6 +228,7 @@ pub extern "C" fn unload() -> i32 {
         1
     }).unwrap_or(1)
 }
+#[cfg(windows)]
 #[no_mangle]
 pub extern "C" fn request(h: HGLOBAL, len: *mut c_long) -> HGLOBAL {
     append_log!(format!("request called"));

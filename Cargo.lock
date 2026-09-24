@@ -282,6 +282,7 @@ dependencies = [
  "chumsky",
  "encoding_rs",
  "indexmap",
+ "libc",
  "once_cell",
  "regex",
  "serde",

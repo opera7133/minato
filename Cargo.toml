@@ -33,7 +33,6 @@ serde_json = "1"
 regex = "1"
 
 # Windows GlobalAlloc/GlobalFree
-winapi = { version = "0.3", features = ["winbase", "minwindef"] }
 ariadne = { version = "0.6.0", default-features = false }
 # グローバル状態管理
 once_cell = "1"
@@ -51,3 +50,9 @@ strip = true          # シンボル削除
 # panic = "abort"にするとcatch_unwind(lib.rs各所)が機能せず、
 # パニックが即プロセスabort(SSP本体ごと落ちる)になるため"unwind"のまま維持
 panic = "unwind"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winbase", "minwindef", "libloaderapi"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
