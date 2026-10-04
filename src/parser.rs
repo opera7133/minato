@@ -5,6 +5,7 @@ use chumsky::extra;
 use chumsky::Parser;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use crate::diagnostic::Diagnostic;
 #[cfg(debug_assertions)] use std::io::Write;
 // ── 型定義（変更なし）────────────────────────────────────
 
@@ -57,6 +58,8 @@ pub struct Line {
 pub struct Spanned<T> {
     pub node: T,
     pub line: u32,
+    /// 由来するファイル名（resolve_stmt_linesで設定。未設定なら空文字）
+    pub file: std::sync::Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +194,8 @@ fn expr<'a>() -> impl Parser<'a, &'a str, Expr, extra::Err<Rich<'a, char>>> + Cl
             .ignore_then(
                 just("\\\\").to(StrPart::Lit("\\\\".to_string()))
                     .or(var_part_interp)
+                    // 「{」が続かない「$」はただの文字（"10$" など）
+                    .or(just('$').then_ignore(just('{').not()).to(StrPart::Lit("$".to_string())))
                     .or(
                         just('\\')
                             .then(
@@ -498,7 +503,12 @@ fn interpolated_str<'a>(
         .collect::<String>()
         .map(StrPart::Lit);
 
-    var_part.or(bare_var).or(sakura_tag).or(lit_part)
+    // 「{」が続かない「$」はただの文字（「10$だね。」など）
+    let lone_dollar = just('$')
+        .then_ignore(just('{').not())
+        .to(StrPart::Lit("$".to_string()));
+
+    var_part.or(bare_var).or(sakura_tag).or(lone_dollar).or(lit_part)
         .repeated()
         .collect::<Vec<_>>()
 }
@@ -541,18 +551,13 @@ fn dialogue<'a>() -> impl Parser<'a, &'a str, Stmt, extra::Err<Rich<'a, char>>> 
         });
 
  
-// キャラ指定なし: \- や \e など（バックスラッシュで始まる行のみ）
+// キャラ指定なし: \- や \e、\q[...] など（バックスラッシュで始まる行のみ）
 let without_chara = surface()
     .or_not()
     .then(
         // バックスラッシュで始まることを要求
-        just('\\')
-            .ignore_then(
-                any().filter(|&c: &char| c != '\r' && c != '\n')
-                    .repeated()
-                    .collect::<String>()
-            )
-            .map(|rest| vec![StrPart::Lit(format!("\\{}", rest))])
+        // セリフ行と同じく ${...} を展開する（foreach直下の \q[${v},…] など）
+        just('\\').rewind().ignore_then(interpolated_str(expr()))
     )
     .then_ignore(ws())
     .then_ignore(
@@ -767,10 +772,10 @@ let while_loop = keyword("while")         // just("while") から変更
                         .ignore_then(
                             // 「else if ...」は入れ子のif_stmt（Stmt::If単体）を
                             // else_bodyのVec<Spanned<Stmt>>に合わせて1要素でラップする。
-                            // このSpannedのlineはIf自体の行であり、check_stmt側では
-                            // Stmt::Ifノード自体の行番号を参照しないため使われない
-                            // （実際に報告されるのは中のthen_body/else_body各文の行）。
-                            if_stmt.map(|s| vec![Spanned { node: s, line: 0 }]).or(block.clone()),
+                            // このSpannedのlineは、codegenでelse ifの条件式の
+                            // エラー位置として使われるため、本物のオフセットを持たせる
+                            // （resolve_stmt_linesが行番号に変換する）。
+                            if_stmt.map_with(|s, e: &mut chumsky::input::MapExtra<'a, '_, &'a str, extra::Err<Rich<'a, char>>>| vec![Spanned { node: s, line: e.span().start as u32, file: std::sync::Arc::from("") }]).or(block.clone()),
                         )
                         .or_not(),
                 )
@@ -890,7 +895,7 @@ let expr_stmt = ident()
         //   ひとまず持たせておく（この時点ではまだ「preprocess後の行番号」で
         //   「元ソースの行番号」ではない）。実際の行番号への変換は
         //   resolve_stmt_lines() でパース完了後にまとめて行う。
-        .map_with(|stmt, e| Spanned { node: stmt, line: e.span().start as u32 })
+        .map_with(|stmt, e| Spanned { node: stmt, line: e.span().start as u32, file: std::sync::Arc::from("") })
     })
 }
 
@@ -898,7 +903,14 @@ let expr_stmt = ident()
 
 pub fn talk<'a>() -> impl Parser<'a, &'a str, Talk, extra::Err<Rich<'a, char>>> + Clone {
     ws_nl()
-        .ignore_then(ident())
+        // SSPのドット付きイベントID（OnUpdate.OnDownloadBegin 等）もトーク名として受け付ける
+        .ignore_then(
+            ident()
+                .separated_by(just('.'))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .map(|parts| parts.join("."))
+        )
         .then_ignore(ws_nl())
         // if(条件式) をオプションで受け取る
         .then(
@@ -993,12 +1005,24 @@ impl PreprocessResult {
     }
 }
 
-pub fn preprocess(src: &str) -> Result<PreprocessResult, String> {
+/// エラー時のDiagnosticにはファイル名が入らない（呼び出し側のload_programが入れる）。
+/// 複数のエラーがあるときは先頭の1件を返す。全件が必要ならpreprocess_allを使う。
+pub fn preprocess(src: &str) -> Result<PreprocessResult, Diagnostic> {
+    preprocess_all(src).map_err(|mut ds| ds.swap_remove(0))
+}
+
+/// preprocessと同じだが、エラーを途中で打ち切らず全件（行番号順）返す。
+/// エラーのある行は読み飛ばして処理を続ける。
+pub fn preprocess_all(src: &str) -> Result<PreprocessResult, Vec<Diagnostic>> {
+    let mut errors: Vec<Diagnostic> = Vec::new();
     let mut out = String::new();
     let mut line_map: Vec<u32> = Vec::new();
     let mut buf: Option<(String, u32)> = None;
     let mut prev_chara: Option<String> = None;
-    let mut brace_stack: Vec<BraceKind> = Vec::new();   // ★ brace_depth → brace_stack
+    // 開いた「{」の種類と行番号。閉じ忘れを開いた行で報告するために行も積む。
+    let mut brace_stack: Vec<(BraceKind, u32)> = Vec::new();
+    // 行頭から始まる「/* … */」コメントの中か。中の「{」を数えないために使う。
+    let mut in_block_comment = false;
     let mut nesting_depth: u32 = 0;
 
     for (line_idx, line) in src.lines().enumerate() {
@@ -1007,18 +1031,14 @@ pub fn preprocess(src: &str) -> Result<PreprocessResult, String> {
 
 
         if ends_with_bare_assign(trimmed) {
-            if let Some((b, start_line)) = buf.take() {
-                out.push_str(&b);
-                out.push('\n');
-                line_map.push(start_line);
-            }
-            return Err(format!(
-                "{}行目: 代入する値がありません。「{}」の後に値を書いてください。",
-                line_num, trimmed
-            ));
+            errors.push(Diagnostic::error(format!(
+                "代入する値がありません。「{}」の後に値を書いてください。",
+                trimmed
+            )).at(line_num));
+            continue;
         }
 // is_in_map は「この行が始まる前のスタック状態」で決める。
-        let is_in_map = matches!(brace_stack.last(), Some(BraceKind::Map));
+        let is_in_map = matches!(brace_stack.last(), Some((BraceKind::Map, _)));
 
         let kind = if trimmed == ";" {
             LineKind::Separator
@@ -1058,13 +1078,32 @@ pub fn preprocess(src: &str) -> Result<PreprocessResult, String> {
         // 「湊: 括弧「{」の話」の一行でbrace_stackが壊れ、
         // 以降 is_in_map が真に張り付いてセリフ結合が効かなくなる。
         // さらに талの閉じ「}」がMapを剥がすため、ズレが後続へ残る。
-        if matches!(kind, LineKind::Code | LineKind::Bare) {
-            let events = scan_braces(trimmed, &mut nesting_depth)
-                .map_err(|e| format!("{}行目: {}", line_num, e))?;
+        // コメント内の「{」も同様に数えない（閉じ忘れの誤検出を防ぐ）。
+        let comment_line = in_block_comment || trimmed.starts_with("/*");
+        if comment_line {
+            in_block_comment = !trimmed.contains("*/");
+        }
+        if !comment_line && matches!(kind, LineKind::Code | LineKind::Bare) {
+            let events = match scan_braces(trimmed, &mut nesting_depth) {
+                Ok(evs) => evs,
+                Err(e) => {
+                    errors.push(Diagnostic::error(e).at(line_num));
+                    continue;
+                }
+            };
             for ev in events {
                 match ev {
-                    BraceEvent::Open(k) => brace_stack.push(k),
-                    BraceEvent::Close => { brace_stack.pop(); }
+                    BraceEvent::Open(k) => brace_stack.push((k, line_num)),
+                    BraceEvent::Close => {
+                        // 閉じすぎの「}」は本来パーサが見つけるが、前処理で
+                        // 別のエラーがあるとパーサまで進まず報告されないため、
+                        // 閉じ忘れと対にしてここで報告する
+                        if brace_stack.pop().is_none() {
+                            errors.push(Diagnostic::error(format!("{}行目の「}}」に対応する「{{」がありません", line_num))
+                                .at(line_num)
+                                .with_hint("余分な「}」を消してください"));
+                        }
+                    }
                 }
             }
         }
@@ -1127,6 +1166,17 @@ pub fn preprocess(src: &str) -> Result<PreprocessResult, String> {
         out.push_str(&b);
         out.push('\n');
         line_map.push(start_line);
+    }
+    // 閉じ忘れはファイル末尾ではなく、開いた行で報告する。
+    // 残ったうち最も内側（最後に開いたもの）が閉じ忘れの可能性が高い。
+    if let Some(&(_, open_line)) = brace_stack.last() {
+        errors.push(Diagnostic::error(format!("{}行目の「{{」が閉じられていません", open_line))
+            .at(open_line)
+            .with_hint("対応する「}」を書いてください"));
+    }
+    if !errors.is_empty() {
+        errors.sort_by_key(|d| d.line());
+        return Err(errors);
     }
     Ok(PreprocessResult { src: out, line_map })
 }
@@ -1260,8 +1310,8 @@ fn extract_chara(s: &str) -> Option<String> {
 
 #[derive(Debug)]
 pub enum LoadError {
-    ParseError(Vec<String>, PathBuf),
-    PreprocessError(String),
+    ParseError(Vec<Diagnostic>, PathBuf),
+    PreprocessError(Diagnostic),
 }
 
 // ── ファイル読み込み ─────────────────────────────────────
@@ -1279,13 +1329,23 @@ pub fn load_program(
     }
     visited.insert(canonical.clone());
 
-    let src = std::fs::read_to_string(entry)
-        .map_err(|e| LoadError::PreprocessError(format!("ファイルが読み込めません: {}", e)))?;
+    let file_name = entry.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let orig_text = std::fs::read_to_string(entry)
+        .map_err(|e| LoadError::PreprocessError(
+            Diagnostic::error(format!("ファイルが読み込めません: {}", e)).in_file(file_name.as_str())
+        ))?;
 
     append_log!("before preprocess");
-    let pre = match preprocess(&src) {
+    let pre = match preprocess_all(&orig_text) {
         Ok(r) => r,
-        Err(e) => return Err(LoadError::PreprocessError(e)),
+        Err(ds) => {
+            let diags = ds.into_iter().map(|d| d.in_file(file_name.as_str())).collect();
+            return Err(LoadError::ParseError(diags, entry.to_path_buf()));
+        }
     };
     let src: &str = &pre.src;
     append_log!("after preprocess");
@@ -1304,21 +1364,16 @@ pub fn load_program(
 }
     append_log!("before parse");
 
-    let file_name = entry.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
     let mut items = program_with_include()
         .parse(src)
         .into_result()
         .map_err(|errors| {
-            let msgs: Vec<String> = errors.iter()
-                .map(|e| rich_to_japanese(e, &pre, &file_name))
+            let diags: Vec<Diagnostic> = errors.iter()
+                .map(|e| rich_to_diagnostic(e, &pre, &orig_text, &file_name))
                 .collect();
-            LoadError::ParseError(msgs, entry.to_path_buf())
+            LoadError::ParseError(diags, entry.to_path_buf())
         })?;
-    resolve_program_item_lines(&mut items, src, &pre);
+    resolve_program_item_lines(&mut items, src, &pre, &file_name);
 
     append_log!("after parse");
 
@@ -1346,82 +1401,102 @@ pub fn load_program(
 
 // ── エラーメッセージ日本語化 ──────────────────────────────
 
-fn rich_to_japanese(e: &Rich<char>, pre: &PreprocessResult, file_name: &str) -> String {
-    let pos = e.span().start as u32;
-    let output_line = line_at_offset(pos, &pre.src);
+fn rich_to_diagnostic(e: &Rich<char>, pre: &PreprocessResult, orig_src: &str, file_name: &str) -> Diagnostic {
+    let pos = e.span().start.min(pre.src.len());
+    let output_line = line_at_offset(pos as u32, &pre.src);
     let line = pre.resolve_line(output_line);
-    let msg = reason_to_japanese(e.reason());
-    format!("{}の{}行目: {}", file_name, line, msg)
+    let (msg, hint) = reason_to_japanese(e.reason());
+    let mut d = Diagnostic::error(msg).in_file(file_name);
+    d = match original_col(pos, &pre.src, orig_src, line) {
+        Some(col) => d.at_col(line, col),
+        None => d.at(line),
+    };
+    if let Some(h) = hint {
+        d = d.with_hint(h);
+    }
+    d
 }
-    
-    fn reason_to_japanese(reason: &chumsky::error::RichReason<char>) -> String {
+
+/// preprocess後のバイトオフセットを、元ソースの桁（1-indexed、文字単位）に直す。
+/// line_mapは行しか対応していないので、preprocess後の行と元ソースの行を先頭から比べ、
+/// 一致している範囲（＝セリフ結合などで書き換わっていない部分）を指すときだけ桁を返す。
+/// 結合で後ろに足された部分を指すときはNone。
+fn original_col(pos: usize, pre_src: &str, orig_src: &str, orig_line: u32) -> Option<u32> {
+    let line_start = pre_src[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col_chars = pre_src[line_start..pos].chars().count();
+    let out_line = pre_src[line_start..].split('\n').next().unwrap_or("");
+    let orig = orig_src.lines().nth((orig_line as usize).checked_sub(1)?)?;
+    let same = out_line.chars().zip(orig.chars()).take_while(|(a, b)| a == b).count();
+    if col_chars < same {
+        Some(col_chars as u32 + 1)
+    } else {
+        None
+    }
+}
+
+/// 見つかったトークンを表示用にする。改行はErrorDescriptionを壊すので文字にしない。
+fn describe_found(found: Option<&char>) -> String {
+    match found {
+        None => "ファイル末尾".to_string(),
+        Some('\n') | Some('\r') => "行末".to_string(),
+        Some('\t') => "タブ".to_string(),
+        Some(c) => format!("「{}」", c),
+    }
+}
+
+/// エラー理由を日本語のメッセージとヒントにする。
+fn reason_to_japanese(reason: &chumsky::error::RichReason<char>) -> (String, Option<String>) {
     use chumsky::error::{RichReason, RichPattern};
 
     match reason {
         // .labelled("日本語") の出力はここに入る → そのまま日本語で出力
-        RichReason::Custom(s) => s.to_string(),
+        RichReason::Custom(s) => (s.to_string(), None),
 
         RichReason::ExpectedFound { expected, found } => {
-            let found_str = match found {
-                None => "ファイル末尾".to_string(),
-                Some(f) => {
-                    let d = format!("{:?}", f);
-                    extract_char_from_debug(&d)
-                        .map(|c| format!("「{}」", c))
-                        .unwrap_or_else(|| "不明な文字".to_string())
+            let found_str = describe_found(found.as_deref());
+
+            // .labelled("日本語") は RichPattern::Label に入る → 優先して使う。
+            // 同じ位置で複数の書き方が候補になると複数並ぶので、重複を除いて
+            // 最初のものを本文に、残りをヒントに回す。
+            let mut labels: Vec<&str> = Vec::new();
+            for p in expected {
+                if let RichPattern::Label(s) = p {
+                    if !labels.contains(&s.as_ref()) {
+                        labels.push(s.as_ref());
+                    }
                 }
-            };
-
-            let exp_count = expected.len();
-            if exp_count == 0 {
-                return format!("予期しない{}があります", found_str);
             }
-
-            // .labelled("日本語") は RichPattern::Label に入る → 優先して使う
-            let labels: Vec<String> = expected.iter()
-                .filter_map(|p| match p {
-                    RichPattern::Label(s) => Some((*s).to_string()),
-                    _ => None,
-                })
-                .collect();
-
-            if !labels.is_empty() {
-                return format!("{}（{}付近）", labels[0], found_str);
+            if let Some((first, rest)) = labels.split_first() {
+                let msg = format!("{}（{}付近）", first, found_str);
+                let hint = if rest.is_empty() {
+                    None
+                } else {
+                    Some(format!("次の可能性もあります: {}", rest.join("／")))
+                };
+                return (msg, hint);
             }
 
             // ラベルなし：トークン一覧を展開
             let tokens: Vec<String> = expected.iter()
                 .filter_map(|p| match p {
-                    RichPattern::Token(t) => Some(format!("「{:?}」", t)),
+                    RichPattern::Token(t) => Some(describe_found(Some(&**t))),
+                    RichPattern::Identifier(s) => Some(format!("「{}」", s)),
                     RichPattern::EndOfInput => Some("ファイル末尾".to_string()),
                     _ => None,
                 })
                 .collect();
 
-            if exp_count <= 3 {
+            // 具体的なトークンが無い（SomethingElse/Anyのみ等）ときは
+            // 「〜が必要なところに」の主語が空になるので、予期しないものとだけ伝える。
+            let msg = if tokens.is_empty() {
+                format!("予期しない{}があります", found_str)
+            } else if tokens.len() <= 3 {
                 format!("{}が必要なところに{}があります", tokens.join("または"), found_str)
             } else {
                 format!("{}付近に記述ミスがあります", found_str)
-            }
+            };
+            (msg, None)
         }
-    }
-}
-
-    
-   fn extract_char_from_debug(s: &str) -> Option<char> {
-    let start = s.find('\'')?;
-    let rest = &s[start + 1..];
-    if rest.starts_with('\\') {
-        match rest.chars().nth(1)? {
-            'n'  => Some('\n'),
-            't'  => Some('\t'),
-            '\\' => Some('\\'),
-            '\'' => Some('\''),
-            'r'  => Some('\r'),
-            c    => Some(c),
-        }
-    } else {
-        rest.chars().next()
     }
 }
 
@@ -1451,24 +1526,25 @@ fn line_at_offset(offset: u32, src: &str) -> u32 {
 
 /// Vec<Spanned<Stmt>>を再帰的に辿り、各Spanned.lineを
 /// 「preprocess後のバイトオフセット」から「元ソースの行番号」に書き換える。
-fn resolve_stmt_lines(stmts: &mut [Spanned<Stmt>], src: &str, pre: &PreprocessResult) {
+fn resolve_stmt_lines(stmts: &mut [Spanned<Stmt>], src: &str, pre: &PreprocessResult, file: &std::sync::Arc<str>) {
     for spanned in stmts.iter_mut() {
         let preprocessed_line = line_at_offset(spanned.line, src);
         spanned.line = pre.resolve_line(preprocessed_line);
+        spanned.file = file.clone();
         match &mut spanned.node {
             Stmt::If(_, then_body, else_body) => {
-                resolve_stmt_lines(then_body, src, pre);
+                resolve_stmt_lines(then_body, src, pre, file);
                 if let Some(eb) = else_body {
-                    resolve_stmt_lines(eb, src, pre);
+                    resolve_stmt_lines(eb, src, pre, file);
                 }
             }
             Stmt::For { body, .. }
             | Stmt::ForEach { body, .. }
-            | Stmt::FuncDef { body, .. } => resolve_stmt_lines(body, src, pre),
-            Stmt::While(_, body) => resolve_stmt_lines(body, src, pre),
+            | Stmt::FuncDef { body, .. } => resolve_stmt_lines(body, src, pre, file),
+            Stmt::While(_, body) => resolve_stmt_lines(body, src, pre, file),
             Stmt::Match { arms, .. } => {
                 for arm in arms.iter_mut() {
-                    resolve_stmt_lines(&mut arm.body, src, pre);
+                    resolve_stmt_lines(&mut arm.body, src, pre, file);
                 }
             }
             _ => {}
@@ -1478,11 +1554,13 @@ fn resolve_stmt_lines(stmts: &mut [Spanned<Stmt>], src: &str, pre: &PreprocessRe
 
 /// program_with_include()の結果全体について、含まれるTalk/FuncDefの
 /// 本体すべての行番号を元ソースの行番号に変換する。
-pub fn resolve_program_item_lines(items: &mut [ProgramItem], src: &str, pre: &PreprocessResult) {
+pub fn resolve_program_item_lines(items: &mut [ProgramItem], src: &str, pre: &PreprocessResult, file_name: &str) {
+    let file: std::sync::Arc<str> = std::sync::Arc::from(file_name);
+    let file = &file;
     for item in items.iter_mut() {
         match item {
-            ProgramItem::Talk(talk) => resolve_stmt_lines(&mut talk.body, src, pre),
-            ProgramItem::FuncDef { body, .. } => resolve_stmt_lines(body, src, pre),
+            ProgramItem::Talk(talk) => resolve_stmt_lines(&mut talk.body, src, pre, file),
+            ProgramItem::FuncDef { body, .. } => resolve_stmt_lines(body, src, pre, file),
             ProgramItem::Include(_) | ProgramItem::Global(_, _, _) => {}
         }
     }
@@ -1536,15 +1614,35 @@ pub fn program_with_include<'a>() -> impl Parser<'a, &'a str, Vec<ProgramItem>, 
         )
         .map(|((name, params), body)| ProgramItem::FuncDef { name, params, body });
 
+    // エラー回復：トップレベル項目の解析に失敗したら、次の項目の開始行
+    // （行頭から始まり「=>」を含む行、またはinclude/func/global）まで読み飛ばし、
+    // 解析を続ける。これにより1ファイル内の複数のエラーを報告できる。
+    let line = none_of('\n').repeated().to_slice();
+    let is_item_start = |s: &str| {
+        s.chars().next().is_some_and(|c| !c.is_whitespace() && c != '}')
+            && (s.contains("=>")
+                || ["include", "func", "global"].iter().any(|k| s.starts_with(k)))
+    };
+    let skip_item = none_of('\n').repeated().at_least(1)
+        .then(
+            just('\n')
+                .ignore_then(line.filter(move |s: &&str| !is_item_start(s)))
+                .repeated()
+        )
+        .to(None);
+
     ws_nl()
         .ignore_then(
             include_directive()
                 .or(top_global)
                 .or(top_func)
                 .or(talk().map(ProgramItem::Talk))
+                .map(Some)
+                .recover_with(via_parser(skip_item))
         )
         .repeated()
         .collect::<Vec<_>>()
+        .map(|items| items.into_iter().flatten().collect::<Vec<_>>())
         .then_ignore(ws_nl())
         .then_ignore(end().labelled("ファイルの末尾に予期しない内容があります"))
 }
@@ -1872,12 +1970,33 @@ fn test_rich_to_japanese_resolves_line_after_dialogue_merge() {
         .parse(&*pre.src)
         .into_result()
         .expect_err("「let x」は「=値」を欠いており構文エラーになるはず");
-    let msg = rich_to_japanese(&errors[0], &pre, "main.mnt");
+    let msg = crate::diagnostic::render_legacy(&rich_to_diagnostic(&errors[0], &pre, &src, "main.mnt"));
     assert!(
         msg.contains("4行目"),
         "preprocess後にズレた行番号ではなく元ソースの4行目が報告されるべき: {}",
         msg
     );
+}
+
+#[test]
+fn test_talk_dotted_event_name() {
+    let src = "OnUpdate.OnDownloadBegin => {
+    湊: ダウンロード開始
+}
+OnUpdate.OnDownloadBegin if(true) => {
+    湊: 条件付き
+}
+OnBoot => {
+    湊: 起動
+}";
+    let pre = preprocess(src).expect("preprocess failed");
+    let items = program_with_include().parse(&*pre.src).into_result().expect("parse failed");
+    let talks: Vec<Talk> = items.into_iter().filter_map(|i| if let ProgramItem::Talk(t) = i { Some(t) } else { None }).collect();
+    assert_eq!(talks.len(), 3);
+    assert_eq!(talks[0].event, "OnUpdate.OnDownloadBegin");
+    assert_eq!(talks[1].event, "OnUpdate.OnDownloadBegin");
+    assert!(talks[1].cond.is_some());
+    assert_eq!(talks[2].event, "OnBoot");
 }
 
 #[cfg(test)]
@@ -1888,7 +2007,7 @@ fn unrecognized_stmt_message(line: &str) -> String {
         .parse(&*pre.src)
         .into_result()
         .expect_err("不明な行は構文エラーになるはず");
-    let msg = rich_to_japanese(&errors[0], &pre, "main.mnt");
+    let msg = crate::diagnostic::render_legacy(&rich_to_diagnostic(&errors[0], &pre, &src, "main.mnt"));
     assert!(msg.contains("認識できない文です"), "{}", msg);
     msg
 }
@@ -1905,4 +2024,245 @@ fn test_unknown_line_with_symbols_has_no_hint() {
     let msg = unrecognized_stmt_message("hoge fuga +");
     assert!(!msg.contains("hoge()"), "{}", msg);
     assert!(!msg.contains("call"), "{}", msg);
+}
+
+#[test]
+fn test_unclosed_brace_reported_at_open_line() {
+    let src = "OnBoot => {
+    湊: おはよう
+";
+    let d = preprocess(src).err().expect("閉じ忘れはエラーになるべき");
+    assert_eq!(d.line(), Some(1));
+    assert!(d.message.contains("1行目の「{」が閉じられていません"), "{:?}", d);
+}
+
+#[test]
+fn test_unclosed_brace_in_nested_block_reports_inner_line() {
+    // ifの「}」を忘れても、トークの「}」がifを閉じてしまうので外側が残る
+    let src = "OnBoot => {
+    if (1) {
+        湊: a
+    }
+    while (1) {
+        湊: b
+}
+";
+    let d = preprocess(src).err().expect("閉じ忘れはエラーになるべき");
+    assert_eq!(d.line(), Some(1), "{:?}", d);
+
+    // 内側が2つ残る場合は最も内側を報告する
+    let src = "OnBoot => {
+    if (1) {
+        湊: a
+";
+    let d = preprocess(src).err().expect("閉じ忘れはエラーになるべき");
+    assert_eq!(d.line(), Some(2), "{:?}", d);
+}
+
+#[test]
+fn test_balanced_file_has_no_unclosed_error() {
+    let src = "OnBoot => {
+    let m = {
+        a: 1
+    }
+    if (1) {
+        湊: 括弧「{」の話
+    } else {
+        湊: 「${m.a}」
+    }
+}
+// {
+/* {
+   { */
+OnClose => {
+    湊: さようなら
+}
+";
+    assert!(preprocess(src).is_ok(), "{:?}", preprocess(src).err());
+}
+
+
+#[test]
+fn test_reason_found_uses_char_directly() {
+    use chumsky::error::{RichReason, RichPattern};
+    use chumsky::util::MaybeRef;
+    let r: RichReason<char> = RichReason::ExpectedFound {
+        expected: vec![RichPattern::Token(MaybeRef::Val('='))],
+        found: Some(MaybeRef::Val('\'')),
+    };
+    assert_eq!(reason_to_japanese(&r).0, "「=」が必要なところに「'」があります");
+    let r: RichReason<char> = RichReason::ExpectedFound {
+        expected: vec![RichPattern::Token(MaybeRef::Val(')'))],
+        found: Some(MaybeRef::Val('\n')),
+    };
+    assert_eq!(reason_to_japanese(&r).0, "「)」が必要なところに行末があります");
+}
+
+#[test]
+fn test_reason_something_else_only_has_subject() {
+    use chumsky::error::{RichReason, RichPattern};
+    let r: RichReason<char> = RichReason::ExpectedFound {
+        expected: vec![RichPattern::SomethingElse],
+        found: None,
+    };
+    assert_eq!(reason_to_japanese(&r).0, "予期しないファイル末尾があります");
+}
+
+#[test]
+fn test_reason_multiple_labels_go_to_hint() {
+    use chumsky::error::{RichReason, RichPattern};
+    use std::borrow::Cow;
+    let r: RichReason<char> = RichReason::ExpectedFound {
+        expected: vec![
+            RichPattern::Label(Cow::Borrowed("Aしてください")),
+            RichPattern::Label(Cow::Borrowed("Bしてください")),
+            RichPattern::Label(Cow::Borrowed("Aしてください")),
+        ],
+        found: None,
+    };
+    let (msg, hint) = reason_to_japanese(&r);
+    assert_eq!(msg, "Aしてください（ファイル末尾付近）");
+    assert_eq!(hint.as_deref(), Some("次の可能性もあります: Bしてください"));
+}
+
+#[test]
+fn test_original_col_on_plain_line() {
+    let orig = "OnBoot => {\n    let x\n}";
+    let pre = preprocess(orig).expect("preprocess failed");
+    let pos = pre.src.find("let").unwrap();
+    assert_eq!(original_col(pos, &pre.src, orig, 2), Some(5));
+}
+
+#[test]
+fn test_original_col_counts_chars_not_bytes() {
+    let orig = "OnBoot => {\n    湊さん = 1\n}";
+    let pre = preprocess(orig).expect("preprocess failed");
+    let pos = pre.src.find(" = ").unwrap() + 1;
+    assert_eq!(original_col(pos, &pre.src, orig, 2), Some(9));
+}
+
+#[test]
+fn test_original_col_none_inside_joined_part() {
+    // 「ふが」は2行目のセリフに結合されるので、結合部分を指す桁は元ソースと一致しない
+    let orig = "OnBoot => {\n    湊: ほげ\n    ふが\n}";
+    let pre = preprocess(orig).expect("preprocess failed");
+    let pos = pre.src.find("ふが").unwrap();
+    assert_eq!(pre.resolve_line(line_at_offset(pos as u32, &pre.src)), 2);
+    assert_eq!(original_col(pos, &pre.src, orig, 2), None);
+    // 結合前の部分は桁が取れる
+    let pos = pre.src.find("ほげ").unwrap();
+    assert_eq!(original_col(pos, &pre.src, orig, 2), Some(8));
+}
+
+#[test]
+fn test_parse_error_diagnostic_has_col() {
+    let orig = "OnBoot => {\n    let x\n}\n";
+    let pre = preprocess(orig).expect("preprocess failed");
+    let errors = program_with_include()
+        .parse(&*pre.src)
+        .into_result()
+        .expect_err("構文エラーになるはず");
+    let d = rich_to_diagnostic(&errors[0], &pre, orig, "main.mnt");
+    assert_eq!(d.line(), Some(2));
+    assert_eq!(d.col(), Some(5), "{:?}", d);
+}
+
+#[test]
+fn test_parse_errors_reported_for_each_talk() {
+    let orig = "OnBoot => {\n    let y\n}\n\nOnClose => {\n    let x\n}\n\nOnOk => {\n    湊: ok\n}\n";
+    let pre = preprocess(orig).expect("preprocess failed");
+    let errors = program_with_include()
+        .parse(&*pre.src)
+        .into_result()
+        .expect_err("構文エラーになるはず");
+    let lines: Vec<_> = errors.iter()
+        .map(|e| rich_to_diagnostic(e, &pre, orig, "main.mnt").line())
+        .collect();
+    assert_eq!(lines, vec![Some(2), Some(6)], "{:?}", errors);
+}
+
+#[test]
+fn test_preprocess_all_reports_every_error() {
+    // 「hoge =」の後も処理を続け、OnBootの「{」の閉じ忘れも報告する
+    let src = "OnBoot => {\n\n    {\n        hoge =\n    }\n\nOnClose => {\n    湊: じゃ\n}\n";
+    let ds = preprocess_all(src).err().expect("エラーになるはず");
+    let lines: Vec<_> = ds.iter().map(|d| d.line()).collect();
+    assert_eq!(lines, vec![Some(1), Some(4)], "{:?}", ds);
+}
+
+#[test]
+fn test_preprocess_all_reports_extra_close_brace() {
+    // 「hoge =」と、末尾の余分な「}」の両方を報告する
+    let src = "OnClose => {\n    hoge =\n    湊: じゃ\n}\n}\n";
+    let ds = preprocess_all(src).err().expect("エラーになるはず");
+    let lines: Vec<_> = ds.iter().map(|d| d.line()).collect();
+    assert_eq!(lines, vec![Some(2), Some(5)], "{:?}", ds);
+    assert!(ds[1].message.contains("5行目の「}」に対応する「{」がありません"), "{:?}", ds[1]);
+}
+
+#[test]
+fn test_standalone_tag_line_expands_interpolation() {
+    // セリフに続かない \q[...] 行（foreach直下など）でも ${...} を展開する
+    let src = r#"OnShop => {
+    うきわ君:いらっしゃい
+    foreach ["x", "y"] as i, v {
+        \q[${v},OnB,${v}]
+    }
+    \-
+}"#;
+    let pre = preprocess(src).expect("preprocess failed");
+    let items = program_with_include().parse(&*pre.src).into_result().expect("parse failed");
+    let ProgramItem::Talk(t) = &items[0] else { panic!("talkではない") };
+    let Stmt::ForEach { body, .. } = &t.body[1].node else { panic!("foreachではない: {:?}", t.body[1].node) };
+    let Stmt::Dialogue(line) = &body[0].node else { panic!("セリフではない") };
+    assert!(line.character.is_none());
+    assert!(matches!(line.content.as_slice(),
+        [StrPart::Lit(a), StrPart::Expr(_), StrPart::Lit(b), StrPart::Expr(_), StrPart::Lit(c)]
+            if a == r"\q[" && b == ",OnB," && c == "]"), "{:?}", line.content);
+    let Stmt::Dialogue(end) = &t.body[2].node else { panic!("セリフではない") };
+    assert!(matches!(end.content.as_slice(), [StrPart::Lit(s)] if s == r"\-"), "{:?}", end.content);
+}
+
+#[test]
+fn test_dotted_word_in_dialogue_is_variable_reference() {
+    // docs/src/error/common.md「セリフ中の「名前.名前」が消える」の前提
+    let src = "OnBoot => {\n    湊: items.jsonを読む\n    湊: ${\"items.json\"}を読む\n}";
+    let pre = preprocess(src).expect("preprocess failed");
+    let items = program_with_include().parse(&*pre.src).into_result().expect("parse failed");
+    let ProgramItem::Talk(t) = &items[0] else { panic!("talkではない") };
+    let Stmt::Dialogue(ng) = &t.body[0].node else { panic!() };
+    assert!(matches!(ng.content.as_slice(), [StrPart::Expr(Expr::Index(..)), StrPart::Lit(_)]), "{:?}", ng.content);
+    let Stmt::Dialogue(ok) = &t.body[1].node else { panic!() };
+    assert!(matches!(ok.content.as_slice(), [StrPart::Expr(Expr::InterpolatedStr(p)), StrPart::Lit(_)]
+        if matches!(p.as_slice(), [StrPart::Lit(s)] if s == "items.json")), "{:?}", ok.content);
+}
+
+#[test]
+fn test_lone_dollar_is_literal() {
+    // 「{」が続かない「$」は、セリフ・\ の行・"…" のどれでもただの文字
+    let src = r#"OnBoot => {
+    湊: 10$だね。
+    \![open,browser,https://example.com/?a=$5]
+    湊: ${"a$b$"}
+}"#;
+    let pre = preprocess(src).expect("preprocess failed");
+    let items = program_with_include().parse(&*pre.src).into_result().expect("parse failed");
+    let ProgramItem::Talk(t) = &items[0] else { panic!("talkではない") };
+    let lit = |i: usize| -> String {
+        let Stmt::Dialogue(d) = &t.body[i].node else { panic!("セリフではない: {:?}", t.body[i].node) };
+        d.content.iter().map(|p| match p { StrPart::Lit(s) => s.clone(), _ => panic!("式がある: {:?}", d.content) }).collect()
+    };
+    assert_eq!(lit(0), "10$だね。");
+    assert_eq!(lit(1), r"\![open,browser,https://example.com/?a=$5]");
+    let Stmt::Dialogue(d) = &t.body[2].node else { panic!() };
+    assert!(matches!(d.content.as_slice(), [StrPart::Expr(Expr::InterpolatedStr(p))]
+        if p.iter().map(|x| match x { StrPart::Lit(s) => s.as_str(), _ => "?" }).collect::<String>() == "a$b$"), "{:?}", d.content);
+}
+
+#[test]
+fn test_unclosed_interpolation_is_still_error() {
+    // 「$」を文字として読むようにしても、閉じていない「${」は今までどおりエラー
+    let src = "OnBoot => {\n    湊: ${abc\n}";
+    let pre = preprocess(src).expect("preprocess failed");
+    assert!(program_with_include().parse(&*pre.src).into_result().is_err());
 }

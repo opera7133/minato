@@ -96,10 +96,16 @@ impl Env {
     fn pop_scope(&mut self)  { self.locals.pop(); }
 
     fn get(&self, key: &str) -> Value {
+        self.get_ref(key).cloned().unwrap_or(Value::Null)
+    }
+
+    /// getの参照版。大きな配列・Mapの一部だけを読みたいときに、
+    /// 全体を複製せずに中を辿るために使う。
+    fn get_ref(&self, key: &str) -> Option<&Value> {
         for scope in self.locals.iter().rev() {
-            if let Some(v) = scope.get(key) { return v.clone(); }
+            if let Some(v) = scope.get(key) { return Some(v); }
         }
-        self.globals.get(key).cloned().unwrap_or(Value::Null)
+        self.globals.get(key)
     }
 
     #[allow(dead_code)]
@@ -119,9 +125,14 @@ impl Env {
         match path {
             [] => Value::Null,
             [key] => self.get(key),
+            // 先頭の変数を丸ごと複製してから辿ると、1MBのJSONを読み込んだ
+            // globalの要素を1つ読むだけで1MB複製することになる。
+            // 参照のまま辿り、最後に取り出す値だけを複製する
             [head, rest @ ..] => {
-                let root = self.get(head);
-                get_nested_str(root, rest)
+                self.get_ref(head)
+                    .and_then(|root| get_nested_str_ref(root, rest))
+                    .cloned()
+                    .unwrap_or(Value::Null)
             }
         }
     }
@@ -142,7 +153,9 @@ impl Env {
 /// 解決済みの文字列キー列でglobalsに書き込む。
 /// PathSegment::Indexの評価はCodegen::resolve_path_segmentsが
 /// eval_expr_fullで事前に済ませている想定。
-pub fn set_path_resolved(&mut self, path: &[String], op: &AssignOp, val: Value) {
+/// 代入できなかった添字の警告文を返す。
+pub fn set_path_resolved(&mut self, path: &[String], op: &AssignOp, val: Value) -> Vec<String> {
+    let mut warns = Vec::new();
     match path {
         [] => {}
         [key] => {
@@ -151,10 +164,11 @@ pub fn set_path_resolved(&mut self, path: &[String], op: &AssignOp, val: Value) 
         }
         [head, rest @ ..] => {
             let root = self.globals.remove(head).unwrap_or(Value::Null);
-            let updated = set_nested_str(root, rest, op, val);
+            let updated = set_nested_str(root, rest, op, val, &mut warns);
             self.globals.insert(head.clone(), updated);
         }
     }
+    warns
 }
 
 /// 旧API。PathSegment::Indexの評価はeval_expr(自由関数、builtinのみ)しか使えず、
@@ -167,12 +181,14 @@ pub fn set_path(&mut self, path: &[PathSegment], op: &AssignOp, val: Value) {
         PathSegment::Key(k) => k.clone(),
         PathSegment::Index(expr) => eval_expr(expr, &*self).to_display(),
     }).collect();
-    self.set_path_resolved(&resolved, op, val);
+    let _ = self.set_path_resolved(&resolved, op, val);
 }
 
 /// 解決済みの文字列キー列で代入する（globalキーワード無しのドット付き代入用）。
 /// headがどこかのローカルスコープにあればそのスコープ内を更新し、なければglobalsを更新する。
-pub fn set_var_path_resolved(&mut self, path: &[String], op: &AssignOp, val: Value) {
+/// 代入できなかった添字の警告文を返す。
+pub fn set_var_path_resolved(&mut self, path: &[String], op: &AssignOp, val: Value) -> Vec<String> {
+    let mut warns = Vec::new();
     match path {
         [] => {}
         [key] => {
@@ -182,16 +198,17 @@ pub fn set_var_path_resolved(&mut self, path: &[String], op: &AssignOp, val: Val
             for i in (0..self.locals.len()).rev() {
                 if self.locals[i].contains_key(head) {
                     let root = self.locals[i].remove(head).unwrap_or(Value::Null);
-                    let updated = set_nested_str(root, rest, op, val);
+                    let updated = set_nested_str(root, rest, op, val, &mut warns);
                     self.locals[i].insert(head.clone(), updated);
-                    return;
+                    return warns;
                 }
             }
             let root = self.globals.remove(head).unwrap_or(Value::Null);
-            let updated = set_nested_str(root, rest, op, val);
+            let updated = set_nested_str(root, rest, op, val, &mut warns);
             self.globals.insert(head.clone(), updated);
         }
     }
+    warns
 }
 
 
@@ -203,7 +220,7 @@ pub fn set_var_path(&mut self, path: &[PathSegment], op: &AssignOp, val: Value) 
         PathSegment::Key(k) => k.clone(),
         PathSegment::Index(expr) => eval_expr(expr, &*self).to_display(),
     }).collect();
-    self.set_var_path_resolved(&resolved, op, val);
+    let _ = self.set_var_path_resolved(&resolved, op, val);
 }
 
 
@@ -264,47 +281,41 @@ fn get_nested(val: Value, path: &[PathSegment], env: &Env) -> Value {
         _ => Value::Null,
     }
 }
-fn get_nested_str(val: Value, path: &[String]) -> Value {
+/// 文字列のパス（${save.a.b}など）で値を辿り、参照を返す。辿れなければNone。
+/// set_nested_str と同様に、数値のキーなら配列の添字として扱う
+/// （${arr.0} のような読み取りが常にNullになる非対称を防ぐため）。
+fn get_nested_str_ref<'a>(val: &'a Value, path: &[String]) -> Option<&'a Value> {
     match (val, path) {
-        (v, []) => v,
-        (Value::Map(mut m), [key, rest @ ..]) => {
-            let child = m.shift_remove(key).unwrap_or(Value::Null);
-            get_nested_str(child, rest)
-        }
-        // set_nested_str は数値キーで配列を辿れるが、
-        // こちら（読み取り側）は元々Mapしか扱っておらず、
-        // ${arr.0} が常にNullになる非対称があった。
+        (v, []) => Some(v),
+        (Value::Map(m), [key, rest @ ..]) => get_nested_str_ref(m.get(key)?, rest),
         (Value::Array(arr), [key, rest @ ..]) => {
-            match key.parse::<usize>() {
-                Ok(i) => {
-                    let child = arr.get(i).cloned().unwrap_or(Value::Null);
-                    get_nested_str(child, rest)
-                }
-                Err(_) => Value::Null,
-            }
+            let i = key.parse::<usize>().ok()?;
+            get_nested_str_ref(arr.get(i)?, rest)
         }
-        _ => Value::Null,
+        _ => None,
     }
 }
 
-fn set_nested_str(val: Value, path: &[String], op: &AssignOp, new_val: Value) -> Value {
+fn set_nested_str(val: Value, path: &[String], op: &AssignOp, new_val: Value, warns: &mut Vec<String>) -> Value {
     match (val, path) {
         (v, []) => apply_op(v, op, new_val),
         (Value::Map(mut m), [key, rest @ ..]) => {
             let child = m.shift_remove(key).unwrap_or(Value::Null);
-            m.insert(key.clone(), set_nested_str(child, rest, op, new_val));
+            m.insert(key.clone(), set_nested_str(child, rest, op, new_val, warns));
             Value::Map(m)
         }
         (Value::Null, [key, rest @ ..]) => {
             let mut m = IndexMap::new();
-            m.insert(key.clone(), set_nested_str(Value::Null, rest, op, new_val));
+            m.insert(key.clone(), set_nested_str(Value::Null, rest, op, new_val, warns));
             Value::Map(m)
         }
         (Value::Array(mut arr), [key, rest @ ..]) => {
-            if let Ok(i) = key.parse::<usize>() {
-                if i < arr.len() {
-                    arr[i] = set_nested_str(arr[i].clone(), rest, op, new_val);
+            match key.parse::<usize>() {
+                Ok(i) if i < arr.len() => {
+                    arr[i] = set_nested_str(arr[i].clone(), rest, op, new_val, warns);
                 }
+                // 負数・小数・非数値キー・長さ以上はどれも代入されない
+                _ => warns.push(format!("配列の添字 {} は範囲外です（長さ {}）", key, arr.len())),
             }
             Value::Array(arr)
         }
@@ -404,7 +415,7 @@ fn append_script_log(msg: &str, dir: &std::path::Path) {
 }
 
 
-const FILE_READ_LIMIT: u64 = 1024 * 1024;
+pub(crate) const FILE_READ_LIMIT: u64 = 1024 * 1024;
 
 const WINDOWS_RESERVED: &[&str] = &[
     "con", "prn", "aux", "nul",
@@ -573,6 +584,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "first", "last", "push", "pop", "slice",
     "has_key", "keys", "values", "delete",
     "count", "sort", "reverse", "unique",
+    "json_parse", "json_stringify",
     "get_property", "choose", "days_since", "saori", "log" , "is_null","format","talk_exists","get", "days_between", 
         "file_read", "file_write", "file_append", "file_move",
 ];
@@ -987,6 +999,76 @@ fn eval_str_with_vars(s: &str, env: &Env) -> String {
     out
 }
 
+/// 辿れなかったときに参照を返すための共有のNull。
+static NULL_VALUE: Value = Value::Null;
+
+/// 値bを添字iで引いた要素への参照を返す。引けなければ、出すべき
+/// エラーの(レベル, メッセージ)を返す。メッセージ中の名前はbaseの式から作る。
+/// 呼び出し側が変数への参照を持ったままでも使えるよう、push_errは呼ばない。
+fn index_ref<'a>(base: &Expr, b: &'a Value, i: &Value) -> Result<&'a Value, (&'static str, String)> {
+    match (b, i) {
+        (Value::Array(arr), Value::Number(n)) => {
+            let n = *n;
+            if n >= 0.0 && n.fract() == 0.0 && (n as usize) < arr.len() {
+                Ok(&arr[n as usize])
+            } else {
+                let name = describe_expr(base).unwrap_or_else(|| "配列".to_string());
+                let idx = Value::Number(n).to_display();
+                let msg = if arr.is_empty() {
+                    format!("{}[{}] は存在しません（{} は空の配列です）", name, idx, name)
+                } else {
+                    format!("{}[{}] は存在しません（要素数 {}、有効な添字は 0〜{}）", name, idx, arr.len(), arr.len() - 1)
+                };
+                Err(("warning", msg))
+            }
+        }
+        (Value::Map(map), key) => {
+            let k = key.to_display();
+            match map.get(&k) {
+                Some(v) => Ok(v),
+                None => {
+                    let base_name = describe_expr(base).unwrap_or_else(|| "Map".to_string());
+                    let name = format!("{}.{}", base_name, k);
+                    Err(("notice", format!("{} というキーはありません{}", name, describe_map_keys(map))))
+                }
+            }
+        }
+        _ => {
+            let msg = match describe_expr(base) {
+                Some(name) => format!("{} は配列でもMapでもないため添字アクセスできません", name),
+                None => "添字アクセスの対象が配列でもMapでもないため添字アクセスできません".to_string(),
+            };
+            Err(("warning", msg))
+        }
+    }
+}
+
+/// エラーメッセージ用に、式を台本上の名前で表す（items / save.name / items[3] など）。
+fn describe_expr(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(p) => Some(p.join(".")),
+        Expr::Index(b, i) => {
+            let b = describe_expr(b)?;
+            Some(match &**i {
+                Expr::Str(k) => format!("{}.{}", b, k),
+                Expr::Number(n) => format!("{}[{}]", b, Value::Number(*n).to_display()),
+                _ => format!("{}[…]", b),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 「（あるキー: a, b）」「（空のMapです）」を作る。キーは最大10個まで。
+fn describe_map_keys(map: &IndexMap<String, Value>) -> String {
+    if map.is_empty() {
+        return "（空のMapです）".to_string();
+    }
+    let mut ks: Vec<&str> = map.keys().take(10).map(|s| s.as_str()).collect();
+    if map.len() > 10 { ks.push("…"); }
+    format!("（あるキー: {}）", ks.join(", "))
+}
+
 // ── Codegen 構造体 ────────────────────────────────────────
 
 pub struct Codegen {
@@ -994,6 +1076,8 @@ pub struct Codegen {
     pub talks: HashMap<String, Vec<Talk>>,
     pub selector: TalkSelector,
     pub errors: Vec<(String, String)>,
+    /// 実行中の文の位置（ファイル名, 行番号）。エラーメッセージの前置に使う。
+    pub current_loc: Option<(std::sync::Arc<str>, u32)>,
     pub ghost_dir: PathBuf,
     /// ロード済みSAORI DLLのキャッシュ。IndexMapの挿入順を
     /// 「最近使った順」に保つLRUとして使う（先頭=最古、末尾=最新）。
@@ -1089,6 +1173,7 @@ impl Codegen {
             talks,
             selector: TalkSelector::new(),
             errors: vec![],
+            current_loc: None,
             ghost_dir,
             saori_cache: IndexMap::new(),
             saori_timed_out: HashSet::new(),
@@ -1159,6 +1244,7 @@ impl Codegen {
 
         self.env.reset_runtime_state();
         self.errors.clear();
+        self.current_loc = None;
          self.spoken_scopes.clear();
 self.current_scope = None;
     }
@@ -1207,10 +1293,7 @@ self.current_scope = None;
     if out.is_empty() {
         append_log!(format!("★EMPTY OUTPUT★ event={}, talk.event={}, body_len={}", event, talk.event, talk.body.len()));
         // 空出力を作者向けエラーとして記録（if分岐やcond条件のミスに気付けるように）
-        self.errors.push((
-            "notice".to_string(),
-            format!("イベント「{}」のトーク「{}」が選ばれましたが、出力が空でした（if分岐やcond条件を確認してください）", event, talk.event)
-        ));
+        self.push_err("notice", format!("イベント「{}」のトーク「{}」が選ばれましたが、出力が空でした（if分岐やcond条件を確認してください）", event, talk.event));
         return None;
     }
     out.push_str("\\e");
@@ -1232,6 +1315,7 @@ self.current_scope = None;
         append_log!(format!("save value: {:?}", self.env.globals.get("save")));
                  self.spoken_scopes.clear();
 self.current_scope = None;
+        self.current_loc = None;
         self.env.push_scope();
         self.inject_talk_locals(refs, virtual_time);
 
@@ -1254,7 +1338,33 @@ self.current_scope = None;
     // ── gen_stmt ──────────────────────────────────────────
 
     fn gen_stmt(&mut self, spanned: &Spanned<Stmt>, out: &mut String) -> Option<FlowControl> {
-        self.gen_stmt_inner(&spanned.node, out)
+        // call先から戻った後のエラーが呼び出し先の行番号にならないよう、必ず元に戻す
+        let prev = self.current_loc.replace((spanned.file.clone(), spanned.line));
+        let r = self.gen_stmt_inner(&spanned.node, out);
+        self.current_loc = prev;
+        r
+    }
+
+    /// get_path_strと同じ値を返しつつ、途中まで辿れて中身のあるMapに
+    /// 最後のキーだけが無い場合（ほぼ確実に打ち間違い）はnoticeを出す。
+    /// 先頭が未定義・途中がNull/空Mapなどは「まだ入っていない」意図的な
+    /// 参照と区別できないので、従来どおり黙ってNullを返す。
+    fn get_path_checked(&mut self, path: &[String]) -> Value {
+        if self.get_path_checked_notice(path).is_some() {
+            return Value::Null;
+        }
+        self.env.get_path_str(path)
+    }
+
+    /// エラーを記録する。実行中の文の位置が分かればそれを前置する。
+    /// メッセージはErrorDescriptionヘッダの1行に入るので改行を含めないこと。
+    fn push_err(&mut self, level: &str, msg: String) {
+        let msg = match &self.current_loc {
+            Some((file, line)) if file.is_empty() => format!("{}行目: {}", line, msg),
+            Some((file, line)) => format!("{}の{}行目: {}", file, line, msg),
+            None => msg,
+        };
+        self.errors.push((level.to_string(), msg));
     }
 
     // Stmt::Forのinit/stepはSpannedでラップされていない生のStmtなので、
@@ -1268,7 +1378,7 @@ self.current_scope = None;
             Stmt::Let(name, expr) => {
                 if name == "__skip__" {
                     if let Expr::Str(bad) = expr {
-                        self.errors.push(("warning".to_string(), format!("認識できない文です: 「{}」", bad)));
+                        self.push_err("warning", format!("認識できない文です: 「{}」", bad));
                     }
                     return None;
                 }
@@ -1284,7 +1394,9 @@ Stmt::Global(path, op, expr) => {
     let resolved = self.resolve_path_segments(path);              // ★追加
     append_log!(format!("before history: save={:?}", self.env.globals.get("save")));
     append_log!(format!("set_path: {:?} {:?}", resolved, val));    // ★path→resolved
-    self.env.set_path_resolved(&resolved, op, val);                // ★set_path→set_path_resolved
+    for w in self.env.set_path_resolved(&resolved, op, val) {      // ★set_path→set_path_resolved
+        self.push_err("warning", w);
+    }
     None
 }
 // codegen.rs — gen_stmt の Stmt::Assign
@@ -1295,7 +1407,9 @@ Stmt::Assign(path, op, expr) => {
         [PathSegment::Key(key)] => self.env.set_var(key, op, val),
         _ => {
             let resolved = self.resolve_path_segments(path);           // ★追加
-            self.env.set_var_path_resolved(&resolved, op, val);        // ★変更
+            for w in self.env.set_var_path_resolved(&resolved, op, val) {  // ★変更
+                self.push_err("warning", w);
+            }
         }
     }
     None
@@ -1320,10 +1434,7 @@ Stmt::For { init, cond, step, body } => {
     loop {
         if !self.eval_expr_full(cond).as_bool() { break; }
         if count >= LOOP_LIMIT {
-            self.errors.push((
-                "warning".to_string(),
-                format!("for文がループ上限（{}回）に達したため打ち切りました。無限ループになっていないか確認してください", LOOP_LIMIT),
-            ));
+            self.push_err("warning", format!("for文がループ上限（{}回）に達したため打ち切りました。無限ループになっていないか確認してください", LOOP_LIMIT));
             break;
         }
         count += 1;
@@ -1347,10 +1458,7 @@ Stmt::For { init, cond, step, body } => {
     match col {
         Value::Array(arr) => {
             if arr.len() > LOOP_LIMIT {
-                self.errors.push((
-                    "warning".to_string(),
-                    format!("foreach文の配列要素数（{}）がループ上限（{}）を超えたため、以降の要素を打ち切りました", arr.len(), LOOP_LIMIT),
-                ));
+                self.push_err("warning", format!("foreach文の配列要素数（{}）がループ上限（{}）を超えたため、以降の要素を打ち切りました", arr.len(), LOOP_LIMIT));
             }
             for (i, v) in arr.iter().enumerate().take(LOOP_LIMIT) {
                 self.env.push_scope();
@@ -1367,10 +1475,7 @@ Stmt::For { init, cond, step, body } => {
         }
         Value::Map(map) => {
             if map.len() > LOOP_LIMIT {
-                self.errors.push((
-                    "warning".to_string(),
-                    format!("foreach文のMap要素数（{}）がループ上限（{}）を超えたため、以降の要素を打ち切りました", map.len(), LOOP_LIMIT),
-                ));
+                self.push_err("warning", format!("foreach文のMap要素数（{}）がループ上限（{}）を超えたため、以降の要素を打ち切りました", map.len(), LOOP_LIMIT));
             }
             for (i, (k, v)) in map.iter().enumerate() {
                 if i >= LOOP_LIMIT { break; }
@@ -1396,10 +1501,7 @@ Stmt::While(cond, body) => {
     loop {
         if !self.eval_expr_full(cond).as_bool() { break; }
         if count >= LOOP_LIMIT {
-            self.errors.push((
-                "warning".to_string(),
-                format!("while文がループ上限（{}回）に達したため打ち切りました。無限ループになっていないか確認してください", LOOP_LIMIT),
-            ));
+            self.push_err("warning", format!("while文がループ上限（{}回）に達したため打ち切りました。無限ループになっていないか確認してください", LOOP_LIMIT));
             break;
         }
         count += 1;
@@ -1540,17 +1642,11 @@ Expr::Call(fname, args) => {
                     self.env.pop_scope();
                 }
                 None => {
-                    self.errors.push((
-                        "notice".to_string(),
-                        format!("「{}()」の候補選択に失敗し、空文字列になりました", fname)
-                    ));
+                    self.push_err("notice", format!("「{}()」の候補選択に失敗し、空文字列になりました", fname));
                 }
             }
                } else {
-            self.errors.push((
-                "notice".to_string(),
-                format!("「{}()」の候補が全てcondで除外され、空文字列になりました", fname)
-            ));
+            self.push_err("notice", format!("「{}()」の候補が全てcondで除外され、空文字列になりました", fname));
         }
         self.env.call_depth -= 1;
         
@@ -1571,10 +1667,7 @@ else {
         // バックグラウンドに取り残された古い呼び出しと新しい呼び出しが
         // 同時に同一DLLのrequest_fnへ入ることを避けるため
         // （詳細はsaori::request_with_timeout / SaoriDllのSync実装コメント参照）。
-        self.errors.push((
-            "warning".to_string(),
-            format!("SAORI「{}」は以前応答がタイムアウトしたため、このロード期間中は呼び出しを停止しています（ゴーストの再読み込みで復帰します）", dll_name)
-        ));
+        self.push_err("warning", format!("SAORI「{}」は以前応答がタイムアウトしたため、このロード期間中は呼び出しを停止しています（ゴーストの再読み込みで復帰します）", dll_name));
         return Value::Array(vec![]);
     }
 
@@ -1582,10 +1675,7 @@ else {
         // ループ内でsaori/get_propertyを繰り返し呼ぶ台本が、STATEのMutexを
         // 保持したまま実質無制限にSSP全体をブロックしないための上限
         // （詳細はMAX_EXTERNAL_CALLS_PER_EVENT参照）。
-        self.errors.push((
-            "warning".to_string(),
-            format!("1イベントあたりの外部呼び出し上限（{}回）に達したため「{}」の呼び出しを無視しました", MAX_EXTERNAL_CALLS_PER_EVENT, dll_name)
-        ));
+        self.push_err("warning", format!("1イベントあたりの外部呼び出し上限（{}回）に達したため「{}」の呼び出しを無視しました", MAX_EXTERNAL_CALLS_PER_EVENT, dll_name));
         return Value::Array(vec![]);
     }
 
@@ -1601,7 +1691,7 @@ else {
         let segs = match validate_rel_path(&dll_name) {
             Ok(s) => s,
             Err(msg) => {
-                self.errors.push(("error".to_string(), format!("{}: 「{}」", msg, dll_name)));
+                self.push_err("error", format!("{}: 「{}」", msg, dll_name));
                 return Value::Str(String::new());
             }
         };
@@ -1621,7 +1711,7 @@ else {
             }
             Err(e)  => {
                 append_log!(format!("saori load failed: {}: {}", dll_name, e));
-                self.errors.push(("error".to_string(), e));
+                self.push_err("error", e);
                 return Value::Str(String::new());
             }
         }
@@ -1631,10 +1721,7 @@ else {
         Some(r) => r,
         None => {
             append_log!(format!("saori request timeout: {}", dll_name));
-            self.errors.push((
-                "warning".to_string(),
-                format!("SAORI「{}」の応答がタイムアウト（{}秒）したため打ち切りました", dll_name, SAORI_CALL_TIMEOUT.as_secs())
-            ));
+            self.push_err("warning", format!("SAORI「{}」の応答がタイムアウト（{}秒）したため打ち切りました", dll_name, SAORI_CALL_TIMEOUT.as_secs()));
             // 以後このロード期間中は呼び出さない。キャッシュからも外し、
             // 取り残されたバックグラウンド呼び出しがArcを持つ間だけ
             // DLLの実体を生かしておく。
@@ -1854,6 +1941,41 @@ else {
 }
 
 
+// json_parse / json_stringifyは、失敗時のNullを正しいJSONのnullと
+// 区別できるようwarningを積む必要があるため、push_errが使えるここに置く。
+"json_parse" => {
+    match vals.get(0) {
+        Some(Value::Str(s)) => match crate::json::parse(s) {
+            Ok(v) => v,
+            Err(msg) => { self.push_err("warning", msg); Value::Null }
+        },
+        // file_readが失敗したときのNullもここに来る。file_read側で
+        // 既にwarningが出ているので、原因が分かるよう型名を添える
+        other => {
+            let got = match other {
+                None => "引数なし",
+                Some(Value::Null) => "null",
+                Some(Value::Number(_)) => "数値",
+                Some(Value::Bool(_)) => "真偽値",
+                Some(Value::Array(_)) => "配列",
+                Some(Value::Map(_)) => "マップ",
+                Some(Value::Str(_)) => unreachable!(),
+            };
+            self.push_err("warning", format!("json_parseには文字列を渡してください（{}が渡されました）", got));
+            Value::Null
+        }
+    }
+}
+
+"json_stringify" => {
+    let v = vals.get(0).cloned().unwrap_or(Value::Null);
+    let pretty = vals.get(1).map(|p| p.as_bool()).unwrap_or(false);
+    match crate::json::stringify(&v, pretty) {
+        Ok(s) => Value::Str(s),
+        Err(msg) => { self.push_err("warning", format!("json_stringify: {}", msg)); Value::Null }
+    }
+}
+
 "format" => {
     let fmt = vals.get(0).map(|v| v.to_display()).unwrap_or_default();
     let mut result = String::new();
@@ -1986,40 +2108,18 @@ Some('s') => {
                     BinOp::Mul => Value::Number(l.as_number() * r.as_number()),
                     BinOp::Div => {
                         let r = r.as_number();
-                        if r == 0.0 { self.errors.push(("warning".to_string(), "ゼロ除算が発生しました".to_string())); Value::Null }
+                        if r == 0.0 { self.push_err("warning", "ゼロ除算が発生しました".to_string()); Value::Null }
                         else { Value::Number(l.as_number() / r) }
                     }
                     BinOp::Mod => {
     let r = r.as_number();
-    if r == 0.0 { self.errors.push(("warning".to_string(), "ゼロ除算が発生しました".to_string())); Value::Null }
+    if r == 0.0 { self.push_err("warning", "ゼロ除算が発生しました".to_string()); Value::Null }
     else { Value::Number(l.as_number() % r) }
 }
                 }
             }
 
-            Expr::Index(base, idx) => {
-                let b = self.eval_expr_full(base); let i = self.eval_expr_full(idx);
-                match (b, i) {
-                    (Value::Array(arr), Value::Number(n)) => {
-                        let idx = n as usize;
-                        if idx >= arr.len() {
-                            self.errors.push(("warning".to_string(), format!("配列の範囲外アクセス [{}] (長さ: {})", idx, arr.len())));
-                            Value::Null
-                        } else { arr[idx].clone() }
-                    }
-                    (Value::Map(map), key) => {
-                        let k = key.to_display();
-                        if !map.contains_key(&k) {
-                            self.errors.push(("notice".to_string(), format!("Mapに存在しないキー \"{}\"", k)));
-                        }
-                        map.get(&k).cloned().unwrap_or(Value::Null)
-                    }
-                    _ => {
-                        self.errors.push(("warning".to_string(), "添字アクセスの対象が配列でもMapでもない".to_string()));
-                        Value::Null
-                    }
-                }
-            }
+            Expr::Index(_, _) => self.eval_index_chain(expr),
 
             Expr::InterpolatedStr(parts) => {
                 let parts = parts.clone();
@@ -2064,11 +2164,83 @@ Expr::Array(items) => Value::Array(items.iter().map(|e| self.eval_expr_full(e)).
 Expr::Str(s)    => Value::Str(s.clone()),
 Expr::Number(n) => Value::Number(*n),
 Expr::Bool(b)   => Value::Bool(*b),
-Expr::Var(path) => self.env.get_path_str(path),
+Expr::Var(path) => self.get_path_checked(path),
         }
     }
 
     // ── ヘルパー群 ────────────────────────────────────────
+
+    /// arr[i].hp のような添字アクセスの連なりを評価する。
+    /// 根元が変数なら、変数を丸ごと複製せず参照のまま辿り、
+    /// 最後に取り出す値だけを複製する。1MBのJSONを読み込んだglobalを
+    /// ループ内で引くと、1回ごとに全体を複製して数msかかっていたため。
+    /// 添字の式は辿り始める前に全部評価しておく（評価にはpush_errなどで
+    /// &mut selfが要り、変数への参照を持ったままでは呼べないため）。
+    fn eval_index_chain(&mut self, expr: &Expr) -> Value {
+        // 外側から集めて、根元→外側の順に並べ直す
+        let mut steps: Vec<(&Expr, &Expr)> = Vec::new();
+        let mut cur = expr;
+        while let Expr::Index(base, idx) = cur {
+            steps.push((&**base, &**idx));
+            cur = base;
+        }
+        steps.reverse();
+
+        let mut errs: Vec<(&'static str, String)> = Vec::new();
+        let result = if let Expr::Var(path) = cur {
+            // 根元の未定義キーのnoticeは従来どおり先に出す
+            let root_missing = self.get_path_checked_notice(path).is_some();
+            let keys: Vec<Value> = steps.iter().map(|(_, i)| self.eval_expr_full(i)).collect();
+            let root = if root_missing {
+                None
+            } else {
+                match path.as_slice() {
+                    [] => None,
+                    [head, rest @ ..] => self.env.get_ref(head).and_then(|r| get_nested_str_ref(r, rest)),
+                }
+            };
+            let mut v: &Value = root.unwrap_or(&NULL_VALUE);
+            for ((base, _), key) in steps.iter().zip(&keys) {
+                v = match index_ref(base, v, key) {
+                    Ok(r) => r,
+                    Err(e) => { errs.push(e); &NULL_VALUE }
+                };
+            }
+            v.clone()
+        } else {
+            // 根元が関数呼び出しなどの一時的な値なら、複製の問題は無いので素直に評価する
+            let mut v = self.eval_expr_full(cur);
+            for (base, idx) in &steps {
+                let key = self.eval_expr_full(idx);
+                v = match index_ref(base, &v, &key) {
+                    Ok(r) => r.clone(),
+                    Err(e) => { errs.push(e); Value::Null }
+                };
+            }
+            v
+        };
+        for (level, msg) in errs {
+            self.push_err(level, msg);
+        }
+        result
+    }
+
+    /// get_path_checkedのうち、キーの打ち間違いを検出してnoticeを出す部分。
+    /// noticeを出したらSome(())を返す。
+    fn get_path_checked_notice(&mut self, path: &[String]) -> Option<()> {
+        if let [head, mid @ .., last] = path {
+            let missing = match self.env.get_ref(head).and_then(|r| get_nested_str_ref(r, mid)) {
+                Some(Value::Map(m)) if !m.is_empty() && !m.contains_key(last) => Some(describe_map_keys(m)),
+                _ => None,
+            };
+            if let Some(keys) = missing {
+                let msg = format!("{} というキーはありません{}", path.join("."), keys);
+                self.push_err("notice", msg);
+                return Some(());
+            }
+        }
+        None
+    }
 
     // codegen.rs — impl Codegen 内、「── ヘルパー群 ──」の直後あたりに追加
 
@@ -2091,12 +2263,12 @@ pub(crate) fn resolve_path_segments(&mut self, path: &[PathSegment]) -> Vec<Stri
             PathReject::Io(m)     => ("warning", m.clone()),
         };
         append_log!(format!("[file] {}: {}", level, msg));
-        self.errors.push((level.to_string(), msg));
+        self.push_err(level, msg);
     }
 
     fn file_warn(&mut self, msg: String) {
         append_log!(format!("[file] warning: {}", msg));
-        self.errors.push(("warning".to_string(), msg));
+        self.push_err("warning", msg);
     }
 
     /// 台本のパス文字列を実パスに解決する。セグメント列も返すのは、
@@ -2226,10 +2398,7 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
             // gen_event（SSPからのイベント）の全滅は時間帯cond等で
             // 日常的に起こる正常系だが、call は作者が「ここで喋る」と
             // 明示した場所なので、無言になったら知らせる。
-            self.errors.push((
-                "notice".to_string(),
-                format!("call「{}」の候補が全てcondで除外され、何も出力されませんでした", name)
-            ));
+            self.push_err("notice", format!("call「{}」の候補が全てcondで除外され、何も出力されませんでした", name));
             return;
         }
         match self.selector.select_alive(name, &alive) {
@@ -2249,10 +2418,7 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
             }
             None => {
                 self.env.call_depth -= 1;
-                self.errors.push((
-                    "notice".to_string(),
-                    format!("call「{}」の候補選択に失敗し、何も出力されませんでした", name)
-                ));
+                self.push_err("notice", format!("call「{}」の候補選択に失敗し、何も出力されませんでした", name));
             }
         }
     }
@@ -2296,7 +2462,7 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
             let s = match p {
                 StrPart::Lit(s) => s.clone(),
                 StrPart::Var(path) => {
-                    let val = self.env.get_path_str(path).to_display();
+                    let val = self.get_path_checked(path).to_display();
                     if val.contains("${") { eval_str_with_vars(&val, &self.env) } else { val }
                 }
                 StrPart::Expr(e) => self.eval_expr_full(e).to_display(),
@@ -2364,6 +2530,138 @@ mod tests {
         let preprocessed = preprocess(src).expect("preprocess failed").src;
         let x = program_with_include().parse(&*preprocessed).unwrap();
         x.into_iter().filter_map(|item| if let ProgramItem::Talk(t) = item { Some(t) } else { None }).collect()
+    }
+
+    /// 行番号・ファイル名まで解決したTalkを返す（load_programと同じ経路）。
+    fn parse_talks_resolved(src: &str) -> Vec<Talk> {
+        use crate::parser::{preprocess, resolve_program_item_lines};
+        let pre = preprocess(src).expect("preprocess failed");
+        let mut items = program_with_include().parse(&*pre.src).unwrap();
+        resolve_program_item_lines(&mut items, &pre.src, &pre, "main.mnt");
+        items.into_iter().filter_map(|item| if let ProgramItem::Talk(t) = item { Some(t) } else { None }).collect()
+    }
+
+    fn run_errors(src: &str) -> (String, Vec<(String, String)>) {
+        let talks = parse_talks_resolved(src);
+        let mut cg = make_gen();
+        let out = cg.gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+        (out, cg.errors)
+    }
+
+    #[test]
+    fn test_index_out_of_range_message() {
+        let (_, errs) = run_errors("OnBoot => {
+    let items = [1, 2, 3]
+    湊: ${items[3]}
+}");
+        assert!(errs.iter().any(|(l, m)| l == "warning"
+            && m == "main.mntの3行目: items[3] は存在しません（要素数 3、有効な添字は 0〜2）"), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_index_negative_warns_and_returns_null() {
+        let (out, errs) = run_errors("OnBoot => {
+    let items = [1, 2, 3]
+    湊: [${items[-1]}]
+}");
+        assert_eq!(out, "\\0[]\\e");
+        assert!(errs.iter().any(|(l, m)| l == "warning" && m.contains("items[-1] は存在しません")), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_index_fractional_warns() {
+        let (out, errs) = run_errors("OnBoot => {
+    let items = [1, 2, 3]
+    湊: [${items[1.5]}]
+}");
+        assert_eq!(out, "\\0[]\\e");
+        assert!(errs.iter().any(|(l, m)| l == "warning" && m.contains("items[1.5] は存在しません")), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_index_empty_array_message() {
+        let (_, errs) = run_errors("OnBoot => {
+    let items = []
+    湊: [${items[0]}]
+}");
+        assert!(errs.iter().any(|(_, m)| m.ends_with("items[0] は存在しません（items は空の配列です）")), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_map_missing_key_lists_keys() {
+        let (_, errs) = run_errors("OnBoot => {
+    let m = {a: 1, b: 2}
+    湊: [${m['y']}]
+    湊: [${m.x}]
+    let e = {}
+    湊: [${e['z']}]
+}");
+        assert!(errs.iter().any(|(l, m)| l == "notice"
+            && m == "main.mntの3行目: m.y というキーはありません（あるキー: a, b）"), "{:?}", errs);
+        assert!(errs.iter().any(|(_, m)| m.ends_with("e.z というキーはありません（空のMapです）")), "{:?}", errs);
+        assert!(errs.iter().any(|(l, m)| l == "notice"
+            && m == "main.mntの4行目: m.x というキーはありません（あるキー: a, b）"), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_var_path_missing_key_silent_for_undefined_or_empty() {
+        // 先頭が未定義・途中が未定義・空Mapは意図的なnullable参照として黙ってNull
+        let (out, errs) = run_errors("OnBoot => {
+    let e = {}
+    湊: [${nothing.x}][${e.x}][${save.a.b}]
+}");
+        assert_eq!(out, "\\0[][][]\\e");
+        assert!(errs.is_empty(), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_var_path_missing_key_nested_and_in_expr() {
+        let (_, errs) = run_errors("OnBoot => {
+    let m = {a: {b: 1}}
+    let v = m.a.c
+    湊: x
+}");
+        assert!(errs.iter().any(|(_, m)| m == "main.mntの3行目: m.a.c というキーはありません（あるキー: b）"), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_error_line_after_joined_dialogue() {
+        let (_, errs) = run_errors("OnBoot => {
+    湊: A
+    湊: B
+    let items = [1]
+    湊: ${items[3]}
+}");
+        assert!(errs.iter().any(|(_, m)| m.starts_with("main.mntの5行目: items[3]")), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_error_line_after_call_returns_to_caller() {
+        let src = "OnBoot => {
+    func hoge() {
+        let z = 1
+        return 'X'
+    }
+    let items = [1]
+    let v = hoge() + items[3]
+}";
+        let (_, errs) = run_errors(src);
+        assert!(errs.iter().any(|(_, m)| m.starts_with("main.mntの7行目: items[3]")), "{:?}", errs);
+    }
+
+    #[test]
+    fn test_error_line_in_else_if_condition() {
+        let src = "OnBoot => {
+    let items = [1]
+    if (false) {
+        湊: a
+    } else if (items[3] == 1) {
+        湊: b
+    }
+    湊: c
+}";
+        let (_, errs) = run_errors(src);
+        assert!(errs.iter().any(|(_, m)| m.starts_with("main.mntの5行目: items[3]")), "{:?}", errs);
     }
 
     const FIXED_TIME: Option<(i32, u32, u32, u32, u32, u32)> = Some((2026, 1, 1, 12, 0, 0));
@@ -2649,6 +2947,29 @@ OnChoiceSelect => {
     refs.insert("0".to_string(), "target_talk".to_string());
     let out = cg.gen_talk(choice_talk, &refs, FIXED_TIME);
     assert_eq!(out, "\\0呼ばれた。\\e");
+}
+#[test]
+fn test_dotted_talk_call_and_event() {
+    let src = r#"
+OnUpdate.OnDownloadBegin => {
+    湊: ダウンロード開始。
+}
+OnBoot => {
+    call OnUpdate.OnDownloadBegin
+}
+"#;
+    let talks = parse_talks(src);
+    let mut chars = HashMap::new();
+    chars.insert("湊".to_string(), "\\0".to_string());
+    let mut talk_map: HashMap<String, Vec<Talk>> = HashMap::new();
+    for t in &talks {
+        talk_map.entry(t.event.clone()).or_default().push(t.clone());
+    }
+    let mut cg = Codegen::new(chars, talk_map.clone(), PathBuf::from("."));
+    let out = cg.gen_event("OnBoot", &talk_map["OnBoot"], &HashMap::new(), FIXED_TIME).unwrap();
+    assert_eq!(out, "\\0ダウンロード開始。\\e");
+    let out = cg.gen_event("OnUpdate.OnDownloadBegin", &talk_map["OnUpdate.OnDownloadBegin"], &HashMap::new(), FIXED_TIME).unwrap();
+    assert_eq!(out, "\\0ダウンロード開始。\\e");
 }
 #[test]
 fn test_not_call_in_or_expr() {
@@ -3168,6 +3489,120 @@ fn test_assign_index_literal_keys_still_work() {
     let talks = parse_talks(src);
     let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
     assert_eq!(out, "\\01/2/5\\e");
+}
+
+#[test]
+fn test_assign_2d_index_bare_variables() {
+    let src = r#"OnBoot => {
+    let map = [[0,0,0],[0,0,0]]
+    let y = 1
+    let x = 2
+    map[y][x] = 1
+    湊: ${map[1][2]}/${map[0][2]}
+}"#;
+    let talks = parse_talks(src);
+    let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    assert_eq!(out, "\\01/0\\e");
+}
+
+#[test]
+fn test_assign_2d_index_expressions() {
+    let src = r#"OnBoot => {
+    let map = [[0,0,0],[0,0,0]]
+    let y = 0
+    let x = 2
+    map[y+1][x-1] = 5
+    湊: ${map[1][1]}
+}"#;
+    let talks = parse_talks(src);
+    let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    assert_eq!(out, "\\05\\e");
+}
+
+#[test]
+fn test_assign_2d_index_compound() {
+    let src = r#"OnBoot => {
+    let map = [[0,0,0],[0,0,3]]
+    let y = 1
+    let x = 2
+    map[y][x] += 1
+    湊: ${map[1][2]}
+}"#;
+    let talks = parse_talks(src);
+    let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    assert_eq!(out, "\\04\\e");
+}
+
+#[test]
+fn test_global_2d_index_bare_variables() {
+    let src = r#"OnBoot => {
+    global save.grid = [[0,0,0],[0,0,0]]
+    let y = 1
+    let x = 2
+    global save.grid[y][x] = 1
+    湊: ${save.grid[1][2]}
+}"#;
+    let talks = parse_talks(src);
+    let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    assert_eq!(out, "\\01\\e");
+}
+
+#[test]
+fn test_assign_2d_index_numeric_literals() {
+    let src = r#"OnBoot => {
+    let map = [[0,0,0],[0,0,0]]
+    map[0][1] = 9
+    湊: ${map[0][1]}
+}"#;
+    let talks = parse_talks(src);
+    let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    assert_eq!(out, "\\09\\e");
+}
+
+#[test]
+fn test_assign_array_index_out_of_range_warns() {
+    let src = r#"OnBoot => {
+    let a = [0, 0, 0]
+    a[3] = 1
+    a[-1] = 1
+    a[1.5] = 1
+    global save.g = [0]
+    global save.g[5] = 1
+    湊: ${a[0]}${a[1]}${a[2]}
+}"#;
+    let talks = parse_talks(src);
+    let mut cg = make_gen();
+    let out = cg.gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    assert_eq!(out, "\\0000\\e");
+    for key in ["3", "-1", "1.5"] {
+        let msg = format!("配列の添字 {} は範囲外です（長さ 3）", key);
+        assert!(cg.errors.iter().any(|(l, m)| l == "warning" && m.ends_with(&msg)), "{}: {:?}", msg, cg.errors);
+    }
+    assert!(
+        cg.errors.iter().any(|(l, m)| l == "warning" && m.ends_with("配列の添字 5 は範囲外です（長さ 1）")),
+        "{:?}", cg.errors
+    );
+}
+
+#[test]
+fn test_assign_index_to_undefined_var_creates_map() {
+    // 現状の仕様の固定: 未定義の変数への添字代入は配列ではなくMapになる
+    let src = r#"OnBoot => {
+    let y = 1
+    let x = 2
+    m[y][x] = 1
+    湊: ok
+}"#;
+    let talks = parse_talks(src);
+    let mut cg = make_gen();
+    cg.gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+    let Some(Value::Map(outer)) = cg.env.globals.get("m") else {
+        panic!("mがMapになっていない: {:?}", cg.env.globals.get("m"));
+    };
+    let Some(Value::Map(inner)) = outer.get("1") else {
+        panic!("m[\"1\"]がMapになっていない: {:?}", outer);
+    };
+    assert!(matches!(inner.get("2"), Some(Value::Number(n)) if *n == 1.0), "{:?}", inner);
 }
 
 #[test]
@@ -4097,6 +4532,197 @@ OnRandomTalk if(false) => {
     fn run_in(cg: &mut Codegen, src: &str) -> String {
         let talks = parse_talks(src);
         cg.gen_talk(&talks[0], &HashMap::new(), FIXED_TIME)
+    }
+
+    // ── 添字アクセスの連なり（参照で辿る経路） ────────────────
+
+    #[test]
+    fn test_index_chain_reads_nested_value() {
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    let t = {"a": [{"hp": 3}, {"hp": 7}]}
+    let i = 1
+    湊: ${t.a[i].hp}|${t["a"][0]["hp"]}
+}"#);
+        assert_eq!(out, "\\07|3\\e");
+        assert!(cg.errors.is_empty(), "{:?}", cg.errors);
+    }
+
+    #[test]
+    fn test_index_chain_failure_messages_unchanged() {
+        // 途中で辿れなくなったら、その段のwarningに続けて、
+        // Nullを添字アクセスしたwarningも従来どおり出る
+        let (_, errs) = run_errors(r#"OnBoot => {
+    let items = [{"hp": 1}]
+    湊: ${items[3].hp ?? 'なし'}
+}"#);
+        let msgs: Vec<&str> = errs.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(msgs.len(), 2, "{:?}", msgs);
+        assert!(msgs[0].contains("items[3] は存在しません（要素数 1、有効な添字は 0〜0）"), "{:?}", msgs);
+        assert!(msgs[1].contains("items[3] は配列でもMapでもないため添字アクセスできません"), "{:?}", msgs);
+    }
+
+    #[test]
+    fn test_index_chain_on_call_result() {
+        // 根元が変数でない（一時的な値の）場合も同じように辿れる
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    湊: ${json_parse('{"a":[5,6]}').a[1]}
+}"#);
+        assert_eq!(out, "\\06\\e");
+    }
+
+    // ── json_parse / json_stringify ──────────────────────────
+
+    #[test]
+    fn test_json_parse_file_with_bom() {
+        let (_home, master) = make_ghost_home();
+        std::fs::write(master.join("items.json"), "\u{feff}{\"薬草\": {\"値段\": 10}}").unwrap();
+        let mut cg = make_file_gen(&master);
+        let out = run_in(&mut cg, r#"OnBoot => {
+    global items = json_parse(file_read('ghost/master/items.json'))
+    湊: ${items.薬草.値段}
+}"#);
+        assert_eq!(out, "\\0 10\\e".replace(' ', ""));
+        assert!(cg.errors.is_empty(), "{:?}", cg.errors);
+    }
+
+    #[test]
+    fn test_json_parse_broken_warns_and_returns_null() {
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    湊: ${json_parse('{"a": 1,') ?? '壊れている'}
+}"#);
+        assert_eq!(out, "\\0壊れている\\e");
+        assert!(cg.errors.iter().any(|(l, m)| l == "warning" && m.contains("JSONの読み込みに失敗しました")), "{:?}", cg.errors);
+        assert!(cg.errors.iter().all(|(_, m)| !m.contains('\n')));
+    }
+
+    #[test]
+    fn test_json_parse_valid_null_does_not_warn() {
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    湊: ${json_parse('null') ?? 'null'}
+}"#);
+        assert_eq!(out, "\\0null\\e");
+        assert!(cg.errors.is_empty(), "正しいnullでwarningを出してはいけない: {:?}", cg.errors);
+    }
+
+    #[test]
+    fn test_json_parse_non_string_warns() {
+        let mut cg = make_gen();
+        run_in(&mut cg, r#"OnBoot => {
+    湊: ${json_parse(123) ?? ''}
+}"#);
+        assert!(cg.errors.iter().any(|(l, m)| l == "warning" && m.contains("数値が渡されました")), "{:?}", cg.errors);
+    }
+
+    #[test]
+    fn test_json_stringify_compact_and_pretty() {
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    let m = json_parse('{"z":1,"a":[true,null,"x"]}')
+    湊: ${json_stringify(m)}
+}"#);
+        assert_eq!(out, "\\0{\"z\":1,\"a\":[true,null,\"x\"]}\\e");
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    湊: ${count(json_stringify(json_parse('{"a":1,"b":2}'), true), chr(10))}
+}"#);
+        // 整形すると「{」「"a": 1,」「"b": 2」「}」の4行（改行3つ）になる
+        assert_eq!(out, "\\03\\e");
+    }
+
+    #[test]
+    fn test_json_stringify_write_and_read_back() {
+        let (_home, master) = make_ghost_home();
+        let mut cg = make_file_gen(&master);
+        run_in(&mut cg, r#"OnBoot => {
+    let p = json_parse('{"進行":{"章":3,"名前":"湊"}}')
+    file_write('ghost/master/out.json', json_stringify(p, true))
+}"#);
+        let written = std::fs::read_to_string(master.join("out.json")).unwrap();
+        assert_eq!(crate::json::parse(&written).map(|v| crate::json::stringify(&v, false)).unwrap().unwrap(),
+            r#"{"進行":{"章":3,"名前":"湊"}}"#);
+    }
+
+    #[test]
+    fn test_json_stringify_too_deep_warns_and_returns_null() {
+        let mut cg = make_gen();
+        let out = run_in(&mut cg, r#"OnBoot => {
+    let v = 1
+    for (let i = 0; i < 200; i++) {
+        v = [v]
+    }
+    湊: ${json_stringify(v) ?? '深すぎ'}
+}"#);
+        assert_eq!(out, "\\0深すぎ\\e");
+        assert!(cg.errors.iter().any(|(l, m)| l == "warning" && m.contains("深すぎます")), "{:?}", cg.errors);
+    }
+
+    #[test]
+    fn test_json_stringify_too_large_warns_and_returns_null() {
+        let mut cg = make_gen();
+        cg.env.globals.insert("big".to_string(), Value::Str("a".repeat(crate::json::MAX_OUTPUT)));
+        let out = run_in(&mut cg, r#"OnBoot => {
+    湊: ${json_stringify(big) ?? '大きすぎ'}
+}"#);
+        assert_eq!(out, "\\0大きすぎ\\e");
+        assert!(cg.errors.iter().any(|(l, m)| l == "warning" && m.contains("大きすぎます")), "{:?}", cg.errors);
+    }
+
+    /// 大きなJSONをglobalに読み込み、ループ内で要素を引いたときの所要時間を測る。
+    /// Array/Mapはアクセスのたびに複製されるため、Arcによる
+    /// Copy-on-Writeへ改修するかの判断材料にする。debugビルドでは遅く出すぎるので
+    /// 通常のテストからは外し、次のように実行する:
+    ///   cargo test --release --lib bench_json_access -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_json_access() {
+        // 約1MBのアイテム表（5000件の配列と、同じ内容をidで引くMap）
+        let mut arr = Vec::new();
+        let mut map = Vec::new();
+        for i in 0..5000 {
+            let item = format!(r#"{{"id":{i},"name":"アイテム{i}","hp":{},"memo":"{}"}}"#, i % 100, "x".repeat(120));
+            map.push(format!(r#""k{i}":{item}"#));
+            arr.push(item);
+        }
+        let arr_json = format!("[{}]", arr.join(","));
+        let map_json = format!("{{{}}}", map.join(","));
+        let (_home, master) = make_ghost_home();
+        std::fs::write(master.join("arr.json"), &arr_json).unwrap();
+        std::fs::write(master.join("map.json"), &map_json).unwrap();
+        println!("arr.json: {} bytes / map.json: {} bytes", arr_json.len(), map_json.len());
+
+        let mut cg = make_file_gen(&master);
+        let t = std::time::Instant::now();
+        run_in(&mut cg, r#"OnBoot => {
+    global arr = json_parse(file_read('ghost/master/arr.json'))
+    global tbl = json_parse(file_read('ghost/master/map.json'))
+}"#);
+        println!("読み込み（2ファイル）: {:?}", t.elapsed());
+        assert!(cg.errors.is_empty(), "{:?}", cg.errors);
+
+        for n in [100, 500] {
+            for (label, expr) in [
+                ("配列 arr[i].hp", "arr[i].hp"),
+                ("Map tbl['k'+i].hp", "tbl['k' + i].hp"),
+                ("パス tbl.k1.hp", "tbl.k1.hp"),
+                // 値そのものを渡す使い方（参照で辿る改修の対象外）
+                ("関数に渡す first_hp(arr)", "first_hp(arr)"),
+            ] {
+                let src = format!("OnBoot => {{\n    func first_hp(a) {{\n        return a[1].hp\n    }}\n    let s = 0\n    for (let i = 0; i < {n}; i++) {{\n        s += {expr}\n    }}\n    湊: ${{s}}\n}}");
+                let t = std::time::Instant::now();
+                let out = run_in(&mut cg, &src);
+                let el = t.elapsed();
+                println!("{label} × {n}回: {:?}（1回 {:?}） 出力={out}", el, el / n);
+                assert!(cg.errors.is_empty(), "{:?}", cg.errors);
+            }
+        }
+        // foreachは配列全体を1回複製してから回る。1周あたりの重さの目安として測る
+        let t = std::time::Instant::now();
+        let out = run_in(&mut cg, "OnBoot => {\n    let s = 0\n    foreach arr as i, v {\n        s += v.hp\n    }\n    湊: ${s}\n}");
+        println!("foreach arr（5000件）: {:?} 出力={out}", t.elapsed());
     }
 
 

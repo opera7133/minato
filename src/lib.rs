@@ -6,6 +6,7 @@ mod sstp;
 // SSPなしで動くCLI構文チェッカー（src/bin/minato_check.rs）から使うためpub
 pub mod parser;
 mod codegen;
+mod json;
 mod config;
 mod runtime;
 #[cfg(windows)]
@@ -18,6 +19,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{load, loadu, request, unload};
 pub mod analyzer;
+pub mod diagnostic;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_long;
@@ -37,6 +39,7 @@ use winapi::um::winbase::{GlobalAlloc, GlobalFree, GMEM_FIXED};
 #[cfg(windows)]
 use winapi::shared::minwindef::HGLOBAL;
 use crate::analyzer::Analyzer;
+use crate::diagnostic::{Diagnostic, Level, render_legacy, render_header, render_balloon_list, sort_diagnostics};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,7 +62,8 @@ struct ManatoState {
     ghost_dir: PathBuf,
     next_talk_time: Instant,
     virtual_time: Option<(i32, u32, u32, u32, u32, u32)>,
-    parse_error: Option<String>,
+    /// ロードを止めた診断（構文エラー・preprocessエラー・静的解析のerror）。並び替え済み。
+    parse_error: Option<Vec<Diagnostic>>,
     /// 台本のロードに失敗した状態か。parse_errorはOnBootで一度だけ返すため
     /// takeされて消えるが、こちらは消えない。save.jsonの上書きガードに使う。
     /// この状態のcodegenはglobalsを読み込んでいないので、保存すると
@@ -297,9 +301,9 @@ fn load_program_guarded(
         Ok(h) => h,
         Err(e) => {
             append_log!(format!("loadu: パーススレッドの起動に失敗しました: {}", e));
-            return Err(LoadError::PreprocessError(
-                "パース処理を開始できませんでした（システムのリソース不足の可能性があります）。少し待ってから再度お試しください。".to_string()
-            ));
+            return Err(LoadError::PreprocessError(Diagnostic::error(
+                "パース処理を開始できませんでした（システムのリソース不足の可能性があります）。少し待ってから再度お試しください。"
+            )));
         }
     };
     let join_result = handle.join();
@@ -308,15 +312,15 @@ fn load_program_guarded(
         Ok(Ok(parse_result)) => parse_result,
         Ok(Err(_panic)) => {
             append_log!("loadu: parser panicked (caught)");
-            Err(LoadError::PreprocessError(
-                "パース中に内部エラーが発生しました。トーク定義の「=>」忘れや、構文の記法を確認してください。".to_string()
-            ))
+            Err(LoadError::PreprocessError(Diagnostic::error(
+                "パース中に内部エラーが発生しました。トーク定義の「=>」忘れや、構文の記法を確認してください。"
+            )))
         }
         Err(_) => {
             append_log!("loadu: parser thread crashed (stack overflow likely)");
-            Err(LoadError::PreprocessError(
-                "パース中にスタックオーバーフローが発生した可能性があります。スクリプトの記法（特にトーク定義の「=>」やブロックの閉じ忘れ）を確認してください。".to_string()
-            ))
+            Err(LoadError::PreprocessError(Diagnostic::error(
+                "パース中にスタックオーバーフローが発生した可能性があります。スクリプトの記法（特にトーク定義の「=>」やブロックの閉じ忘れ）を確認してください。"
+            )))
         }
     }
 }
@@ -370,8 +374,8 @@ let _main_for_err = main.clone();
 let (all_talks, all_funcs, all_globals) = match load_program_guarded(&main) {
     Ok(result) => result,
 
-    Err(LoadError::PreprocessError(msg)) => {
-        // preprocessエラーはそのままメッセージを使う
+    Err(LoadError::PreprocessError(d)) => {
+        let msg = vec![d];
         let state = ManatoState {
             codegen: Codegen::new(config.characters.clone(), HashMap::new(),dir.to_path_buf()) ,
             talks: HashMap::new(),
@@ -389,8 +393,9 @@ let (all_talks, all_funcs, all_globals) = match load_program_guarded(&main) {
         };
         return Ok(state);
     }
-Err(LoadError::ParseError(msgs, _err_path)) => {
-    let msg = msgs.join("\\n");
+Err(LoadError::ParseError(diags, _err_path)) => {
+    let mut msg = diags;
+    sort_diagnostics(&mut msg);
 
     let state = ManatoState {
         codegen: Codegen::new(config.characters.clone(), HashMap::new(), dir.to_path_buf()),
@@ -431,15 +436,14 @@ let talk_names: HashSet<String> = talks.keys().cloned().collect();
 let analyze_errors = Analyzer::new(talk_names, func_names)
     .analyze(&talks, &all_funcs);
 
-let error_only: Vec<_> = analyze_errors.iter()
-    .filter(|e| e.level == "error")
+let mut error_only: Vec<Diagnostic> = analyze_errors.iter()
+    .filter(|e| e.level == Level::Error)
+    .cloned()
     .collect();
 
 if !error_only.is_empty() {
-    let msg = error_only.iter()
-        .map(|e| format!("{}内 {}行目: {}", e.event, e.line, e.message))
-        .collect::<Vec<_>>()
-        .join("\\n");
+    sort_diagnostics(&mut error_only);
+    let msg = error_only;
     // ... return Ok(state) でブロック
 
     let state = ManatoState {
@@ -459,14 +463,14 @@ if !error_only.is_empty() {
     };
     return Ok(state);
 }
-           for _e in analyze_errors.iter().filter(|e| e.level == "notice") {
-    append_log!(format!("notice: {}内 {}行目: {}", _e.event, _e.line, _e.message));
+           for _e in analyze_errors.iter().filter(|e| e.level == Level::Notice) {
+    append_log!(format!("notice: {}", render_legacy(_e)));
 }
 
 // ★追加: 静的チェックのwarningは最初のイベント応答で一度だけ返す
 let analyze_warnings: Vec<(String, String)> = analyze_errors.iter()
-    .filter(|e| e.level == "warning")
-    .map(|e| ("warning".to_string(), format!("{}内 {}行目: {}", e.event, e.line, e.message)))
+    .filter(|e| e.level == Level::Warning)
+    .map(|e| (e.level.as_str().to_string(), render_header(e)))
     .collect();
 
 if let Some(_v) = talks.get("OnMouseDoubleClick") {
@@ -562,7 +566,9 @@ fn apply_top_globals(
     for (path, op, expr) in globals {
         let val = codegen.eval_expr_full(expr);
         let resolved = codegen.resolve_path_segments(path);
-        codegen.env.set_path_resolved(&resolved, op, val);
+        for w in codegen.env.set_path_resolved(&resolved, op, val) {
+            codegen.errors.push(("warning".to_string(), w));
+        }
         append_log!(format!("top-level global applied: {:?} {:?}", resolved, op));
     }
 }
@@ -621,11 +627,12 @@ fn handle_request(req: &str) -> String {
     };
 if state.parse_error.is_some() {
     if event == "OnBoot" {
-        let msg = state.parse_error.take().unwrap();
+        let diags = state.parse_error.take().unwrap();
         let mut errors = std::mem::take(&mut state.init_errors);
-        errors.push(("error".to_string(), msg.clone()));
+        // ErrorDescriptionには全件を載せる（バルーン本文は先頭数件に打ち切る）
+        errors.extend(diags.iter().map(|d| (d.level.as_str().to_string(), render_header(d))));
         return shiori_response_with_error(
-            &format!("\\b[2]\\0パースエラー:\\n{}\\e", msg),
+            &format!("\\b[2]\\0パースエラー:\\n{}\\e", render_balloon_list(&diags)),
             &errors
         );
     }
@@ -888,7 +895,7 @@ fn save_globals(globals: &HashMap<String, Value>, dir: &Path) -> Result<(), Stri
     // save.* を保存
     if let Some(Value::Map(m)) = globals.get("save") {
         let save_json: serde_json::Map<String, serde_json::Value> = m.iter()
-            .map(|(k, v)| (k.clone(), value_to_json(v)))
+            .filter_map(|(k, v)| persisted_json(k, v))
             .collect();
         json_map.insert("save".to_string(), serde_json::Value::Object(save_json));
     }
@@ -897,8 +904,8 @@ fn save_globals(globals: &HashMap<String, Value>, dir: &Path) -> Result<(), Stri
     if let Some(Value::Map(m)) = globals.get("system") {
         let mut system_json: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         for key in  PERSISTED_SYSTEM_KEYS {
-            if let Some(v) = m.get(*key) {
-                system_json.insert(key.to_string(), value_to_json(v));
+            if let Some((k, j)) = m.get(*key).and_then(|v| persisted_json(key, v)) {
+                system_json.insert(k, j);
             }
         }
         if !system_json.is_empty() {
@@ -928,6 +935,20 @@ fn save_globals(globals: &HashMap<String, Value>, dir: &Path) -> Result<(), Stri
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
+/// save.jsonに書く1項目をJSONに変換する。入れ子が深すぎる項目は飛ばす。
+/// 1項目のせいで保存全体が失敗すると、他の正常なセーブデータまで
+/// 失われるため、その項目だけを諦める。unload中で台本のwarningとして
+/// 出す先が無いので、ログにだけ残す。
+fn persisted_json(key: &str, v: &Value) -> Option<(String, serde_json::Value)> {
+    match json::value_to_json(v) {
+        Ok(j) => Some((key.to_string(), j)),
+        Err(_e) => {
+            append_log!(format!("save.json: 「{}」を保存しませんでした: {}", key, _e));
+            None
+        }
+    }
+}
+
 /// save.jsonのsystem.*を返り値として返す。
 /// system.*だけは「台本のトップレベルglobalより、save.jsonに永続化された値を
 /// 常に優先する」ため、apply_top_globals適用後にもう一度このsystem.*を
@@ -948,7 +969,7 @@ fn load_globals(codegen: &mut Codegen, dir: &Path) -> Result<Option<Value>, Stri
     let mut persisted_system: Option<Value> = None;
     if let serde_json::Value::Object(map) = val {
         for (k, v) in map {
-            let value = json_to_value(v);
+            let value = json::json_to_value(v);
             if k == "system" {
                 merge_system_globals(&mut codegen.env.globals, value.clone());
                 persisted_system = Some(value);
@@ -977,30 +998,6 @@ for (k, v) in loaded_map {
     }
 }
     globals.insert("system".to_string(), Value::Map(existing_map));
-}
-fn json_to_value(v: serde_json::Value) -> codegen::Value {
-    match v {
-        serde_json::Value::Null => codegen::Value::Null,
-        serde_json::Value::Bool(b) => codegen::Value::Bool(b),
-        serde_json::Value::Number(n) => codegen::Value::Number(n.as_f64().unwrap_or(0.0)),
-        serde_json::Value::String(s) => codegen::Value::Str(s),
-        serde_json::Value::Array(a) => codegen::Value::Array(a.into_iter().map(json_to_value).collect()),
-         serde_json::Value::Object(o) => codegen::Value::Map(
-            o.into_iter()
-                .map(|(k, v)| (k, json_to_value(v)))
-                .collect::<IndexMap<_, _>>()  // ← 変更
-        ),
-    }
-}
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Str(s) => serde_json::Value::String(s.clone()),
-        Value::Number(n) => serde_json::json!(*n),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Array(a) => serde_json::Value::Array(a.iter().map(value_to_json).collect()),
-        Value::Map(m) => serde_json::Value::Object(m.iter().map(|(k,v)| (k.clone(), value_to_json(v))).collect()),
-        Value::Null => serde_json::Value::Null,
-    }
 }
 
 
@@ -1192,10 +1189,8 @@ mod save_load_tests {
     }
 
     // ── IndexMapのキー順序 ───────────────────────────────────
-    // JSON Object → IndexMap の変換でinsert順が保たれるか
-    // serde_json は Object のキー順を保証しないが、
-    // save_globals が pretty_print するので順序は記録される。
-    // ただし json_to_value 経由で IndexMap に戻す際の順序を確認する。
+    // serde_jsonのpreserve_orderにより、save.* のキー順が
+    // 保存→読み込みを経ても台本で入れた順のまま保たれるか
 
     #[test]
     fn test_roundtrip_key_order() {
@@ -1220,12 +1215,30 @@ mod save_load_tests {
         };
 
         let restored_keys: Vec<&str> = save.keys().map(|s| s.as_str()).collect();
-        // serde_json::Map はキー順を保証しないので、
-        // 順序ではなく「全キーが揃っているか」だけ確認する
-        for k in &keys {
-            assert!(save.contains_key(*k), "キー「{}」が消えた", k);
-        }
-        assert_eq!(restored_keys.len(), keys.len());
+        assert_eq!(restored_keys, keys, "キー順が保たれていない");
+    }
+
+    // ── 深すぎる値はその項目だけ保存しない ──────────────────
+
+    #[test]
+    fn test_too_deep_save_item_is_skipped() {
+        let dir = temp_dir();
+        let mut cg = make_gen();
+
+        let mut deep = Value::Null;
+        for _ in 0..(json::MAX_DEPTH + 10) { deep = Value::Array(vec![deep]); }
+        let mut m = IndexMap::new();
+        m.insert("deep".to_string(), deep);
+        m.insert("ok".to_string(), Value::Number(3.0));
+        cg.env.globals.insert("save".to_string(), Value::Map(m));
+
+        save_globals(&cg.env.globals, dir.path()).expect("save失敗");
+
+        let mut gen2 = make_gen();
+        load_globals(&mut gen2, dir.path()).expect("load失敗");
+        let Some(Value::Map(save)) = gen2.env.globals.get("save") else { panic!("saveが無い") };
+        assert!(!save.contains_key("deep"), "深すぎる項目は保存されないはず");
+        assert!(matches!(save.get("ok"), Some(Value::Number(n)) if *n == 3.0));
     }
 
 
@@ -1855,3 +1868,105 @@ fn test_panic_bak_notice_delivered_even_on_parse_error() {
 }
 }
 
+
+// ── バルーン本文・ErrorDescriptionの出力形式の確認 ──
+#[cfg(test)]
+fn init_with_main(main: &str, extra: &[(&str, &str)]) -> ManatoState {
+    let dir = tempfile::tempdir().expect("tempdir作成失敗");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[characters]\n\"湊\" = \"\\\\0\"\n",
+    ).expect("config.toml書き込み失敗");
+    std::fs::create_dir(dir.path().join("talks")).expect("talks作成失敗");
+    std::fs::write(dir.path().join("talks").join("main.mnt"), main).expect("main.mnt書き込み失敗");
+    for (name, body) in extra {
+        std::fs::write(dir.path().join("talks").join(name), body).expect("書き込み失敗");
+    }
+    let state = init(dir.path()).expect("init失敗");
+    drop(dir);
+    state
+}
+
+
+/// initした状態でOnBootを送り、(バルーン本文, ErrorDescription) を返す。
+#[cfg(test)]
+fn boot_error_parts(state: ManatoState) -> (String, String) {
+    if let Ok(mut s) = STATE.lock() { *s = Some(state); }
+    let req = "SEND SHIORI/3.0\r\nID: OnBoot\r\nSender: SSP\r\nCharset: UTF-8\r\n\r\n";
+    let res = handle_request(req);
+    if let Ok(mut s) = STATE.lock() { *s = None; }
+    let header = |name: &str| res.lines()
+        .find_map(|l| l.strip_prefix(name))
+        .unwrap_or_else(|| panic!("{}が無い: {}", name, res))
+        .to_string();
+    (header("Value: "), header("ErrorDescription: "))
+}
+
+#[test]
+fn test_balloon_preprocess_error_has_file_name() {
+    let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let state = init_with_main("OnBoot => {\n    let x =\n}\n", &[]);
+    let (body, desc) = boot_error_parts(state);
+    let expected = "main.mntの2行目: 代入する値がありません。「let x =」の後に値を書いてください。";
+    assert_eq!(body, format!("\\b[2]\\0パースエラー:\\n{}\\e", expected));
+    assert_eq!(desc, expected);
+}
+
+#[test]
+fn test_balloon_preprocess_error_in_included_file() {
+    let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let state = init_with_main(
+        "include \"sub.mnt\"\nOnBoot => {\n    湊: おはよう\n}\n",
+        &[("sub.mnt", "OnClose => {\n    let y =\n}\n")],
+    );
+    let (body, _) = boot_error_parts(state);
+    assert!(body.contains("\\nsub.mntの2行目: "), "include先のファイル名が付いていない: {}", body);
+}
+
+#[test]
+fn test_balloon_unclosed_brace_shows_hint_on_next_line() {
+    let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let state = init_with_main("OnBoot => {\n    湊: おはよう\n", &[]);
+    let (body, desc) = boot_error_parts(state);
+    assert_eq!(
+        body,
+        "\\b[2]\\0パースエラー:\\nmain.mntの1行目: 1行目の「{」が閉じられていません\\nヒント: 対応する「}」を書いてください\\e"
+    );
+    assert_eq!(desc, "main.mntの1行目: 1行目の「{」が閉じられていません ヒント: 対応する「}」を書いてください");
+}
+
+#[test]
+fn test_balloon_analyze_error_shows_context() {
+    let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let state = init_with_main("OnBoot => {\n    break\n}\n", &[]);
+    let (body, desc) = boot_error_parts(state);
+    assert_eq!(body, "\\b[2]\\0パースエラー:\\nmain.mntの2行目（OnBoot内）: ループの外で break を使っています\\e");
+    assert_eq!(desc, "main.mntの2行目（OnBoot内）: ループの外で break を使っています");
+}
+
+#[test]
+fn test_balloon_truncates_but_error_description_has_all() {
+    let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    // ループ外breakを5件。イベント名順ではなく行番号順に並ぶこと
+    let state = init_with_main(
+        "ZZZ => {\n    break\n}\nAAA => {\n    break\n}\nMMM => {\n    break\n}\nBBB => {\n    break\n}\nCCC => {\n    break\n}\n",
+        &[],
+    );
+    let (body, desc) = boot_error_parts(state);
+    let lines: Vec<&str> = body.split("\\n").collect();
+    assert_eq!(lines.len(), 5, "見出し＋3件＋他n件になるべき: {}", body);
+    assert!(lines[1].starts_with("main.mntの2行目（ZZZ内）"), "{}", body);
+    assert!(lines[2].starts_with("main.mntの5行目（AAA内）"), "{}", body);
+    assert!(lines[3].starts_with("main.mntの8行目（MMM内）"), "{}", body);
+    assert_eq!(lines[4], "他2件（minato_check で全件を確認できます）\\e");
+    assert_eq!(desc.split('\x01').count(), 5, "ErrorDescriptionには全件載るべき: {}", desc);
+}
+
+#[test]
+fn test_balloon_parse_error_is_single_line_header() {
+    let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let state = init_with_main("OnBoot => {\n    let x\n}\n", &[]);
+    let (body, desc) = boot_error_parts(state);
+    assert!(body.contains("\\nmain.mntの2行目: "), "{}", body);
+    assert!(desc.starts_with("main.mntの2行目: "), "{}", desc);
+}

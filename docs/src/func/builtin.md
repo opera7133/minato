@@ -160,6 +160,13 @@ OnBoot => {
 
 `saori` の詳細は[SAORI連携](../saori/saori.md)を参照してください。
 
+## JSON
+
+| 関数 | 説明 | 戻り値 |
+|---|---|---|
+| `json_parse(s)` | JSONの文字列を値（マップ・配列など）に変換する | 変換した値。失敗したら `null` |
+| `json_stringify(v, pretty)` | 値をJSONの文字列に変換する。`pretty` が `true` なら字下げ付き、省略すると1行 | JSONの文字列。失敗したら `null` |
+
 ## ファイル操作
 
 | 関数 | 説明 | 戻り値 |
@@ -169,21 +176,4 @@ OnBoot => {
 | `file_append(path, text, enc)` | ファイルの末尾に追記する（なければ作る） | 成功したら `true`、失敗したら `false` |
 | `file_move(from, to, overwrite)` | ファイルを移動（名前変更）する | 成功したら `true`、失敗したら `false` |
 
-```
-OnBoot => {
-    let ok = file_write("ghost/master/memo.txt", "こんにちは")
-    湊: ${ok}|${file_read("ghost/master/memo.txt")}
-}
-```
-
-- `path` は、ゴーストのホーム（`ghost` フォルダの1つ上）からの相対パスで書きます。`/` でも `\` でも構いません。ドライブ指定・絶対パス・`..` を含むパスは使えません。
-- `enc`（文字コード）は省略でき、既定は UTF-8 です。Shift_JIS のファイルは `"sjis"` を指定します（`"utf8"` も指定できます）。
-- `file_read` で読めるのは 1MB までです。それを超えるファイルや、UTF-8 として読めないファイルは `null` になります。
-- 書き込みできるのは `ghost/master` の中だけです。次のものには書き込めません（`file_move` の移動元・移動先も同じです）。
-  - `talks` フォルダの中（台本）
-  - `config.toml`、`descript.txt`、`save.json` で始まるファイル
-  - `.dll` ファイル
-  - `minato_` で始まるファイル
-- `file_move` は、移動先に同名のファイルがあると、既定では移動せず `false` を返します。上書きするには、第3引数に `true` を指定します。フォルダは移動できません。
-- `file_write` は一時ファイルを経由して書き込むので、途中で落ちても既存のファイルが壊れません（`file_append` は直接追記します）。
-- 失敗したときは、応答の `ErrorLevel` / `ErrorDescription` に警告が載ります。禁止されたパスを指定した場合は、警告ではなくエラーになります。
+書き込みできる場所の制限や使用例は[ファイルとJSON](../file/index.md)を参照してください。
