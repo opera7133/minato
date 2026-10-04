@@ -5,12 +5,19 @@
 // サンプルのファイルをそのまま (ホーム)/ghost/master に置き、乱数に頼らず
 // 戦闘や持ち物を確かめるためのイベントだけをテスト側で main.mnt に書き足す。
 
+#[cfg(windows)]
 use std::ffi::c_long;
+#[cfg(target_os = "macos")]
+use std::ffi::c_int as c_long;
 use std::fs;
 use std::path::Path;
 
 use encoding_rs::SHIFT_JIS;
+#[cfg(windows)]
 use winapi::shared::minwindef::HGLOBAL;
+#[cfg(target_os = "macos")]
+type HGLOBAL = *mut std::ffi::c_void;
+#[cfg(windows)]
 use winapi::um::winbase::{GlobalAlloc, GlobalFree, GMEM_FIXED};
 
 const GET_PROPERTY_SUFFIX_HEAD: &str = "\\![get,property,OnGotVirtualTime,";
@@ -34,7 +41,10 @@ OnTestHp => {
 
 fn alloc(bytes: &[u8]) -> HGLOBAL {
     unsafe {
+        #[cfg(windows)]
         let mem = GlobalAlloc(GMEM_FIXED, bytes.len() + 1);
+        #[cfg(target_os = "macos")]
+        let mem = libc::malloc(bytes.len() + 1);
         let p = mem as *mut u8;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         *p.add(bytes.len()) = 0;
@@ -56,13 +66,24 @@ fn send(id: &str, r#ref: &str) -> String {
     }
     req += "\r\n";
     let (enc, _, _) = SHIFT_JIS.encode(&req);
+    #[cfg(windows)]
+    let h = alloc(&enc);
+    #[cfg(target_os = "macos")]
+    let enc = req.replace("Charset: Shift_JIS", "Charset: UTF-8").into_bytes();
+    #[cfg(target_os = "macos")]
     let h = alloc(&enc);
     let mut len = enc.len() as c_long;
     let out = minato::request(h, &mut len);
     assert!(!out.is_null(), "{} の応答がnull", id);
     let bytes = unsafe { std::slice::from_raw_parts(out as *const u8, len as usize) }.to_vec();
+    #[cfg(windows)]
     unsafe { GlobalFree(out) };
-    SHIFT_JIS.decode(&bytes).0.into_owned()
+    #[cfg(target_os = "macos")]
+    unsafe { libc::free(out) };
+    #[cfg(windows)]
+    { SHIFT_JIS.decode(&bytes).0.into_owned() }
+    #[cfg(target_os = "macos")]
+    { String::from_utf8(bytes).unwrap() }
 }
 
 /// 応答からValueを取り出す。警告やエラーが付いていたら失敗にする

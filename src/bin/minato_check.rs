@@ -179,6 +179,10 @@ fn print_all(diags: &[Diagnostic], sources: &mut SourceFiles, color: bool) {
 /// 旧来のコンソール（ドラッグ&ドロップで開くcmd等）は既定で無効なので、
 /// 有効にできなかったときは false を返し、色なしで表示する。
 /// コンソールでない（パイプ・リダイレクト先）ときは何もせず true。
+#[cfg(not(windows))]
+fn enable_console_color() -> bool { true }
+
+#[cfg(windows)]
 fn enable_console_color() -> bool {
     use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
     use winapi::um::processenv::GetStdHandle;
