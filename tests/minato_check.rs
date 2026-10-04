@@ -1,3 +1,5 @@
+#![cfg(feature = "cli")]
+
 // minato_checkバイナリ（src/bin/minato_check.rs）の結合テスト。
 // SSPを介さずに構文エラー・静的解析結果とexit codeが期待通りになることを確認する。
 // 実行: cargo test --features cli
