@@ -76,7 +76,7 @@ pub extern "C" fn request(pointer: *mut c_void, length: *mut i32) -> *mut c_void
                 super::PANICKED.store(true, std::sync::atomic::Ordering::Relaxed);
                 super::error_response("panic")
             });
-        let response = response.replacen("Charset: Shift_JIS\r\n", "Charset: UTF-8\r\n", 1);
+        let response = super::encode_response(&response, true);
         if response.len() > MAX_BYTES as usize {
             return std::ptr::null_mut();
         }
