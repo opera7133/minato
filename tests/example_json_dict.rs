@@ -59,10 +59,19 @@ fn send(id: &str) -> String {
     unsafe { GlobalFree(out) };
     #[cfg(target_os = "macos")]
     unsafe { libc::free(out) };
-    #[cfg(windows)]
-    { SHIFT_JIS.decode(&bytes).0.into_owned() }
-    #[cfg(target_os = "macos")]
-    { String::from_utf8(bytes).unwrap() }
+    decode_response(&bytes)
+}
+
+/// 応答を、応答自身の Charset ヘッダに従って文字列にする（ヘッダはASCIIなので先に読める）。
+fn decode_response(bytes: &[u8]) -> String {
+    let head = String::from_utf8_lossy(bytes);
+    let utf8 = head.lines().take_while(|l| !l.is_empty())
+        .any(|l| l.eq_ignore_ascii_case("Charset: UTF-8"));
+    if utf8 {
+        String::from_utf8(bytes.to_vec()).expect("Charset: UTF-8 なのにUTF-8として読めない")
+    } else {
+        SHIFT_JIS.decode(bytes).0.into_owned()
+    }
 }
 
 /// 応答からValueを取り出す。警告やエラーが付いていたら失敗にする

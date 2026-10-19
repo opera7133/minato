@@ -1,4 +1,4 @@
-// 移行ガイド（docs/src/migration/*.md）のサンプルコードを実際のDLLエントリポイント
+// 移行ガイド（docs/src/migration/*.md）と基本の書き方（docs/src/basic/*.md）、チートシート（docs/src/cheatsheet.md）のサンプルコードを実際のDLLエントリポイント
 // （loadu / request / unload）で実行し、ガイドに書かれた出力と一致するか検証する。
 //
 // ガイド側の書式:
@@ -79,9 +79,22 @@ fn send(id: &str, refs: &[String]) -> String {
     }
     let bytes = unsafe { std::slice::from_raw_parts(out as *const u8, len as usize) }.to_vec();
     #[cfg(windows)]
-    { unsafe { GlobalFree(out) }; SHIFT_JIS.decode(&bytes).0.into_owned() }
+    unsafe { GlobalFree(out) };
     #[cfg(target_os = "macos")]
-    { unsafe { libc::free(out) }; String::from_utf8(bytes).unwrap() }
+    unsafe { libc::free(out) };
+    decode_response(&bytes)
+}
+
+/// 応答を、応答自身の Charset ヘッダに従って文字列にする（ヘッダはASCIIなので先に読める）。
+fn decode_response(bytes: &[u8]) -> String {
+    let head = String::from_utf8_lossy(bytes);
+    let utf8 = head.lines().take_while(|l| !l.is_empty())
+        .any(|l| l.eq_ignore_ascii_case("Charset: UTF-8"));
+    if utf8 {
+        String::from_utf8(bytes.to_vec()).expect("Charset: UTF-8 なのにUTF-8として読めない")
+    } else {
+        SHIFT_JIS.decode(bytes).0.into_owned()
+    }
 }
 
 /// 応答からValueを取り出す。204は「(204)」。
@@ -306,20 +319,35 @@ fn run_sample(s: &Sample) -> Result<(), String> {
     }
 }
 
-fn guide_dir() -> PathBuf {
-    // 作業中の下書きを検証したいとき用（既定は docs/src/migration）
+fn guide_dirs() -> Vec<PathBuf> {
+    // 作業中の下書きを検証したいとき用（既定は docs/src/migration と docs/src/basic）
     if let Ok(d) = std::env::var("MIGRATION_GUIDE_DIR") {
-        return PathBuf::from(d);
+        return vec![PathBuf::from(d)];
     }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs").join("src").join("migration")
+    let src = docs_src();
+    vec![src.join("migration"), src.join("basic")]
+}
+
+// ディレクトリ単位ではなく、1ファイルだけ検証するページ
+fn guide_files() -> Vec<PathBuf> {
+    if std::env::var("MIGRATION_GUIDE_DIR").is_ok() {
+        return Vec::new();
+    }
+    vec![docs_src().join("cheatsheet.md")]
+}
+
+fn docs_src() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("docs").join("src")
 }
 
 #[test]
 fn guide_samples_match_real_behavior() {
-    let mut files: Vec<PathBuf> = fs::read_dir(guide_dir())
-        .expect("docs/src/migration がありません")
+    let mut files: Vec<PathBuf> = guide_dirs()
+        .iter()
+        .flat_map(|d| fs::read_dir(d).unwrap_or_else(|_| panic!("{} がありません", d.display())))
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map_or(false, |x| x == "md"))
+        .chain(guide_files())
         .collect();
     files.sort();
 

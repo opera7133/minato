@@ -2,6 +2,8 @@
 
 [はじめに](README.md)
 
+[チートシート](cheatsheet.md)
+
 - [湊とは](intro/what_is_minato.md)
 - [インストールと最初のゴースト](intro/install.md)
 
@@ -9,6 +11,7 @@
   - [ファイル構成](basic/files.md)
   - [トーク定義](basic/talk.md)
   - [セリフの書き方](basic/dialogue.md)
+  - [選択肢とウェイト](basic/choice.md)
   - [コメント](basic/comment.md)
 
 - [変数とデータ](data/index.md)
@@ -43,6 +46,7 @@
 - [ファイルとJSON](file/index.md)
 
 - [エラーと対処](error/index.md)
+  - [構文チェッカー](error/checker.md)
   - [パースエラーの読み方](error/parse.md)
   - [よくあるミス](error/common.md)
 
