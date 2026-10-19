@@ -32,7 +32,6 @@ type HGLOBAL = *mut std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
 use encoding_rs::SHIFT_JIS;
 #[cfg(windows)]
 use winapi::shared::minwindef::HGLOBAL;
