@@ -146,7 +146,9 @@ fn decode_request(bytes: &[u8]) -> String {
 // ② append_log 関数の直後に以下を追加
 // ═══════════════════════════════════════════════════════════
 
+// 呼び出し元はSSPで、ポインタの正しさはSSPが保証する。
 #[cfg(windows)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn loadu(h: HGLOBAL, len: c_long) -> i32 {
     append_log!(format!("loadu start"));
@@ -210,7 +212,9 @@ pub extern "C" fn loadu(h: HGLOBAL, len: c_long) -> i32 {
     })
 }
 
+// 呼び出し元はSSPで、ポインタの正しさはSSPが保証する。
 #[cfg(windows)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn load(h: HGLOBAL, len: c_long) -> i32 {
     append_log!(format!("load called"));
@@ -278,7 +282,9 @@ pub extern "C" fn unload() -> i32 {
         1
     }).unwrap_or(1)
 }
+// 呼び出し元はSSPで、ポインタの正しさはSSPが保証する。
 #[cfg(windows)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn request(h: HGLOBAL, len: *mut c_long) -> HGLOBAL {
     append_log!(format!("request called"));
@@ -287,18 +293,21 @@ pub extern "C" fn request(h: HGLOBAL, len: *mut c_long) -> HGLOBAL {
         return std::ptr::null_mut();
     }
     let response = std::panic::catch_unwind(|| {
-        unsafe {
+        // decode_requestは所有型のStringを返すため、hへの借用(bytes)は
+        // このクロージャの中で終わる。
+        let req_str = unsafe {
             let bytes = std::slice::from_raw_parts(h as *const u8, safe_len(*len));
-            let req_str = decode_request(bytes);
+            decode_request(bytes)
+        };
+        handle_request(&req_str) // ← GlobalFreeより先に処理を終わらせる
+    });
 
-            let result = handle_request(&req_str); // ← GlobalFreeより先に処理を終わらせる
+    // hの解放はcatch_unwindの外で1回だけ行う。handle_requestがパニックしても
+    // ここに来るため、SSPから受け取ったバッファがリークしない。
+    unsafe { GlobalFree(h); }
 
-            GlobalFree(h); // ← 解放はこの位置に移動
-
-            result
-        }
-    }).unwrap_or_else(|e| {
-        let _msg = e.downcast_ref::<&str>().map(|s| *s)
+    let response = response.unwrap_or_else(|e| {
+        let _msg = e.downcast_ref::<&str>().copied()
             .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("unknown panic");
         append_log!(format!("request: panic: {}", _msg));
@@ -431,7 +440,7 @@ let (all_talks, all_funcs, all_globals) = match load_program_guarded(&main) {
             virtual_time: None,
             parse_error: Some(msg),
             load_failed:true,
-           init_errors:  init_errors,
+           init_errors,
             talk_interval_secs: config.settings.talk_interval_secs,
             talk_jitter_secs: config.settings.talk_jitter_secs,
              hwnd: 0,
@@ -452,7 +461,7 @@ Err(LoadError::ParseError(diags, _err_path)) => {
         virtual_time: None,
         parse_error: Some(msg),
         load_failed:true,
-        init_errors: init_errors,
+        init_errors,
         talk_interval_secs: config.settings.talk_interval_secs,
         talk_jitter_secs: config.settings.talk_jitter_secs,
         hwnd: 0,
@@ -481,6 +490,7 @@ let talk_names: HashSet<String> = talks.keys().cloned().collect();
 
 // 静的チェック（all_funcsをムーブする前に）
 let analyze_errors = Analyzer::new(talk_names, func_names)
+    .with_global_names(analyzer::top_global_names(&all_globals))
     .analyze(&talks, &all_funcs);
 
 let mut error_only: Vec<Diagnostic> = analyze_errors.iter()
@@ -501,7 +511,7 @@ if !error_only.is_empty() {
         virtual_time: None,
         parse_error: Some(msg),
         load_failed:true,
-        init_errors: init_errors,
+        init_errors,
         talk_interval_secs: config.settings.talk_interval_secs,
         talk_jitter_secs: config.settings.talk_jitter_secs,
         hwnd: 0,
@@ -689,9 +699,7 @@ if state.parse_error.is_some() {
     // ランダムトーク判定
 let actual_event = if event == "OnMinuteChange" {
     // ↓先に仮想時刻取得を返す
-    let script = format!(
-        "\\![get,property,OnGotVirtualTime,system.year,system.month,system.day,system.hour,system.minute,system.second]\\e"
-    );
+    let script = "\\![get,property,OnGotVirtualTime,system.year,system.month,system.day,system.hour,system.minute,system.second]\\e".to_string();
     if parse_reference(req, 3) != "1" {
         return shiori_response(&script);
     }
@@ -772,7 +780,7 @@ if actual_event == "OnRandomTalk" || actual_event == "OnAITalk" {
     );
 }
 let mut errors: Vec<(String, String)> = std::mem::take(&mut state.init_errors);
-errors.extend(state.codegen.errors.drain(..));
+errors.append(&mut state.codegen.errors);
 
 // ↓ 追加: system.* の変更を STATE に即時反映
 if let Some(Value::Map(ref m)) = state.codegen.env.globals.get("system") {
