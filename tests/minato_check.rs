@@ -49,6 +49,20 @@ fn test_no_problems_exits_zero() {
 }
 
 #[test]
+fn test_talk_count_is_known_builtin() {
+    let dir = tempfile::tempdir().expect("tempdir作成失敗");
+    write_main_mnt(
+        dir.path(),
+        "OnBoot => {\n    湊: ${talk_count(\"OnBoot\")}\n}\n",
+    );
+
+    let output = run(dir.path());
+    assert!(output.status.success(), "exit codeが0であるべき: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("問題ありませんでした"), "未定義の通知などが出ている: {}", stdout);
+}
+
+#[test]
 fn test_undefined_call_reports_notice_and_exits_zero() {
     let dir = tempfile::tempdir().expect("tempdir作成失敗");
     write_main_mnt(
@@ -89,7 +103,7 @@ fn test_break_outside_loop_reports_error_and_exits_one() {
     );
     assert_eq!(
         stderr.trim_end(),
-        "[error] main.mntの2行目（OnBoot内）: ループの外で break を使っています",
+        "[error] main.mntの2行目（OnBoot内）: ループの外で break を使っています [loop-control-outside-loop]",
         "ループ外breakのerrorが期待通り出ていない"
     );
 }

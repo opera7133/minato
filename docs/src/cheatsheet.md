@@ -199,11 +199,11 @@ auto_newline = true
 | 型の変換・判定 | `to_str` `to_num` `is_num` `is_str` `is_null` `type_of` |
 | 文字列 | `len` `contains` `replace` `split` `join` `trim` `substr` `to_hankaku` `to_zenkaku` |
 | 正規表現 | `regex_match` `regex_find` `regex_captures` `regex_replace`（`\d` は1つの `\` で書く） |
-| 配列 | `len` `push` `pop` `first` `last` `slice` `index_of` `sort` `reverse` `unique` |
+| 配列 | `len` `push` `pop` `first` `last` `slice` `index_of` `sort` `reverse` `unique` `pick` `shuffle` `draw` |
 | マップ | `has_key` `keys` `values` `delete` `get(map, key, 既定値)` |
 | 条件 | `choose(条件, a, b)`、`talk_exists("名前")` |
 | 日付 | `days_since(年, 月, 日)`、`days_between(…)` |
-| デバッグ | `log(値)`（`debug_log = true` のとき `minato_debug.log` へ） |
+| デバッグ | `log(値)`（`debug_log = true` のとき `minato_debug.log` へ）、`talk_count("名前")`（同名トークの定義数。`if` の結果は関係ない） |
 | 外部連携 | `get_property("…")`、`saori("x.dll", …)`（合わせて1イベント10回まで） |
 | ファイル・JSON | `file_read` `file_write` `json_parse` `json_stringify` |
 

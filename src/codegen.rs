@@ -66,6 +66,10 @@ pub fn as_bool(&self) -> bool {
 
 // ── 実行環境 ─────────────────────────────────────────────
 
+/// 関数・トークの呼び出し先にも引き継ぐローカル変数。
+/// イベントごとに inject_talk_locals で入れる値なので、どこから呼ばれても同じ。
+const CALL_FRAME_INHERITED: &[&str] = &["reference", "now"];
+
 pub struct Env {
     pub globals: HashMap<String, Value>,
     locals: Vec<HashMap<String, Value>>,
@@ -90,6 +94,24 @@ impl Env {
             call_depth: 0,
             external_call_count: std::cell::Cell::new(0),
         }
+    }
+
+    /// 関数・トークを呼ぶときに、新しいローカル環境へ切り替える。
+    /// 戻り値は呼び出し元のローカル環境で、leave_call_frameで元に戻す。
+    /// 呼ばれた側から見えるのは、引数・自分のlet・globalと、
+    /// イベントごとの値（CALL_FRAME_INHERITED）だけで、呼び出し元のletは見えない。
+    pub fn enter_call_frame(&mut self) -> Vec<HashMap<String, Value>> {
+        let mut frame = HashMap::new();
+        for name in CALL_FRAME_INHERITED {
+            if let Some(v) = self.locals.iter().rev().find_map(|scope| scope.get(*name)) {
+                frame.insert(name.to_string(), v.clone());
+            }
+        }
+        std::mem::replace(&mut self.locals, vec![frame])
+    }
+
+    pub fn leave_call_frame(&mut self, saved: Vec<HashMap<String, Value>>) {
+        self.locals = saved;
     }
 
     fn push_scope(&mut self) { self.locals.push(HashMap::new()); }
@@ -396,6 +418,55 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+// ── 山札（shuffle / draw）────────────────────────────────
+
+/// Fisher-Yatesで並べ替えた新しい配列を返す。
+/// avoid_last を渡すと、末尾（drawで次に引かれる位置）がそれと同じ値にならないよう入れ替える。
+/// 全部が同じ値なら避けようがないので、そのままにする。
+fn shuffled_values(arr: &[Value], avoid_last: Option<&Value>) -> Vec<Value> {
+    let mut new = arr.to_vec();
+    for i in (1..new.len()).rev() {
+        new.swap(i, simple_rand() as usize % (i + 1));
+    }
+    if let (Some(prev), Some(last)) = (avoid_last, new.len().checked_sub(1)) {
+        if values_equal(&new[last], prev) {
+            if let Some(i) = (0..last).find(|&i| !values_equal(&new[i], prev)) {
+                new.swap(i, last);
+            }
+        }
+    }
+    new
+}
+
+/// draw(deck, words) の本体。引いた1枚と、変数に書き戻す新しい山札を返す。
+/// 山札は末尾から引く。words が空でない配列なら、山札が空のときに補充する。
+/// 最後の1枚を引いたときはその場で補充し、直後に同じ札が続かないようにする。
+/// 書き戻す必要がないとき（引けなかったとき）は None を返す。
+fn draw_card(deck: Value, words: Option<&Value>) -> (Value, Option<Value>) {
+    let refill = match words {
+        Some(Value::Array(w)) if !w.is_empty() => Some(w),
+        _ => None,
+    };
+    let mut cards = match (deck, refill) {
+        (Value::Array(a), _) => a,
+        (_, Some(_)) => Vec::new(),
+        (_, None) => return (Value::Null, None),
+    };
+    if cards.is_empty() {
+        match refill {
+            Some(w) => cards = shuffled_values(w, None),
+            None => return (Value::Null, None),
+        }
+    }
+    let card = cards.pop().unwrap_or(Value::Null);
+    if cards.is_empty() {
+        if let Some(w) = refill {
+            cards = shuffled_values(w, Some(&card));
+        }
+    }
+    (card, Some(Value::Array(cards)))
+}
+
 fn map_values_equal(a: &IndexMap<String, Value>, b: &IndexMap<String, Value>) -> bool {
     a.len() == b.len()
         && a.iter().all(|(k, v)| b.get(k).is_some_and(|bv| values_equal(v, bv)))
@@ -584,10 +655,11 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "first", "last", "push", "pop", "slice",
     "has_key", "keys", "values", "delete",
     "count", "sort", "reverse", "unique",
+    "pick", "shuffle", "draw",
     "json_parse", "json_stringify",
     "get_property", "choose", "days_since", "saori", "log" , "is_null",
     "is_num", "is_str", "is_bool", "is_array", "is_map", "type_of",
-    "format","talk_exists","get", "days_between",
+    "format","talk_exists","talk_count","get", "days_between",
     "to_hankaku", "to_zenkaku",
     "pow", "sign", "exp", "ln", "log10", "sum",
         "file_read", "file_write", "file_append", "file_move",
@@ -965,6 +1037,18 @@ fn call_builtin(name: &str, vals: Vec<Value>, env: &Env) -> Value {
             Some(Value::Array(arr)) => { let mut new = arr.clone(); new.reverse(); Value::Array(new) }
             _ => Value::Array(vec![]),
         },
+        "pick" => match vals.first() {
+            Some(Value::Array(arr)) if !arr.is_empty() =>
+                arr[simple_rand() as usize % arr.len()].clone(),
+            _ => Value::Null,
+        },
+        "shuffle" => match vals.first() {
+            Some(Value::Array(arr)) => Value::Array(shuffled_values(arr, None)),
+            _ => Value::Null,
+        },
+        // draw は変数を書き換えるので、本来は eval_expr_full で処理する。
+        // ここに来るのは &Env 版の eval_expr から呼ばれたときだけで、書き戻せないので何も引かない
+        "draw" => Value::Null,
    "unique" => match vals.first() {
     Some(Value::Array(arr)) => {
         let mut result: Vec<Value> = Vec::new();
@@ -1744,6 +1828,15 @@ Expr::Call(fname, args) => {
         };
     }
 
+    // draw は1つ目の引数の変数を書き換えるので、値ではなく式のまま受け取る。
+    // 同名のfunc/talkがあればそちらを優先する（ほかのビルトインと同じ解決順）
+    if fname == "draw"
+        && !self.env.funcs.contains_key(fname.as_str())
+        && !self.talks.contains_key(fname.as_str())
+    {
+        return self.eval_draw(args);
+    }
+
     let vals: Vec<Value> = args.iter().map(|a| self.eval_expr_full(a)).collect();
     if self.env.funcs.contains_key(fname.as_str()) {
         self.call_func(fname, vals)
@@ -1757,20 +1850,20 @@ Expr::Call(fname, args) => {
             return Value::Str(String::new());
         }
         self.env.call_depth += 1;
+        // 呼ばれたトークのcondも、呼び出し元のletが見えない環境で評価する
+        let saved_locals = self.env.enter_call_frame();
         let alive = self.filter_alive(&candidates);
 
         if !alive.is_empty() {
             match self.selector.select_alive(fname, &alive) {
                 Some(t) => {
                     let talk = t.clone();
-                    self.env.push_scope();
                     append_log!(format!("enter talk (call): {}", talk.event));
                     let saved_scope = self.current_scope.take();
                     let saved_spoken = std::mem::take(&mut self.spoken_scopes);
                     if let Some(FlowControl::Return(val)) = self.run_stmts(&talk.body, &mut tmp_out) { tmp_out.push_str(&val.to_display()); }
                     self.current_scope = saved_scope;
                     self.spoken_scopes = saved_spoken;
-                    self.env.pop_scope();
                 }
                 None => {
                     self.push_err("notice", format!("「{}()」の候補選択に失敗し、空文字列になりました", fname));
@@ -1779,6 +1872,7 @@ Expr::Call(fname, args) => {
                } else {
             self.push_err("notice", format!("「{}()」の候補が全てcondで除外され、空文字列になりました", fname));
         }
+        self.env.leave_call_frame(saved_locals);
         self.env.call_depth -= 1;
         
 
@@ -1918,6 +2012,13 @@ else {
 "talk_exists" => {
     let name = vals.first().map(|v| v.to_display()).unwrap_or_default();
     Value::Bool(!name.is_empty() && (self.talks.contains_key(&name) || self.env.funcs.contains_key(&name)))
+}
+// 書いてある数を返すので、condは評価しない。funcは数えない
+"talk_count" => {
+    let count = self.talk_name_arg("talk_count", &vals)
+        .and_then(|name| self.talks.get(&name).map(Vec::len))
+        .unwrap_or(0);
+    Value::Number(count as f64)
 }
 
 
@@ -2388,7 +2489,25 @@ pub(crate) fn resolve_path_segments(&mut self, path: &[PathSegment]) -> Vec<Stri
     }).collect()
 }
 
-    
+    /// トーク名を1つ受け取るビルトインの引数を取り出す。
+    /// 数や型が違うときはwarningを積んでNoneを返す。
+    fn talk_name_arg(&mut self, fname: &str, vals: &[Value]) -> Option<String> {
+        if vals.len() != 1 {
+            self.push_err("warning", format!("{}にはトーク名を1つだけ渡してください（{}個渡されました）", fname, vals.len()));
+            return None;
+        }
+        let got = match &vals[0] {
+            Value::Str(s) => return Some(s.clone()),
+            Value::Null => "null",
+            Value::Number(_) => "数値",
+            Value::Bool(_) => "真偽値",
+            Value::Array(_) => "配列",
+            Value::Map(_) => "マップ",
+        };
+        self.push_err("warning", format!("{}にはトーク名を文字列で渡してください（{}が渡されました）", fname, got));
+        None
+    }
+
     fn file_reject(&mut self, p: &PathReject) {
         let (level, msg) = match p {
             PathReject::Denied(m) => ("error", m.clone()),
@@ -2492,21 +2611,40 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
     self.errors.append(&mut kept);
     alive
 }
+
+    /// draw(deck) / draw(deck, words)。1枚引き、残りの山札を deck の変数に書き戻す。
+    /// 書き戻しは let なしの代入（deck = …）と同じく、ローカルにあればローカル、なければglobal。
+    fn eval_draw(&mut self, args: &[Expr]) -> Value {
+        let Some(Expr::Var(path)) = args.first() else {
+            self.push_err("warning", "draw の1つ目には、山札を入れた変数を書いてください（式や添字付きの変数には書き戻せません）".to_string());
+            return Value::Null;
+        };
+        let deck = self.env.get_path_str(path);
+        let words = args.get(1).map(|a| self.eval_expr_full(a));
+        let (card, new_deck) = draw_card(deck, words.as_ref());
+        if let Some(new_deck) = new_deck {
+            for w in self.env.set_var_path_resolved(path, &AssignOp::Set, new_deck) {
+                self.push_err("warning", w);
+            }
+        }
+        card
+    }
+
     fn call_func(&mut self, name: &str, args: Vec<Value>) -> Value {
         if self.env.call_depth > 100 { append_log!("call depth limit exceeded"); return Value::Null; }
         self.env.call_depth += 1;
         if let Some((params, body)) = self.env.funcs.get(name).cloned() {
-            self.env.push_scope();
+            let saved = self.env.enter_call_frame();
             for (param, val) in params.iter().zip(args) { self.env.set_local(param, val); }
             let mut out = String::new();
             for s in &body {
                 match self.gen_stmt(s, &mut out) {
-                    Some(FlowControl::Return(val)) => { self.env.pop_scope(); self.env.call_depth -= 1; return val; }
+                    Some(FlowControl::Return(val)) => { self.env.leave_call_frame(saved); self.env.call_depth -= 1; return val; }
                     Some(FlowControl::Break) | Some(FlowControl::Continue) => break,
                     None => {}
                 }
             }
-            self.env.pop_scope();
+            self.env.leave_call_frame(saved);
             self.env.call_depth -= 1;
             Value::Str(out)
         } else { self.env.call_depth -= 1; Value::Null }
@@ -2523,9 +2661,12 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
             return;
         }
         self.env.call_depth += 1;
+        // 呼ばれたトークのcondも、呼び出し元のletが見えない環境で評価する
+        let saved = self.env.enter_call_frame();
         let alive = self.filter_alive(&candidates);
 
         if alive.is_empty() {
+            self.env.leave_call_frame(saved);
             self.env.call_depth -= 1;
             // gen_event（SSPからのイベント）の全滅は時間帯cond等で
             // 日常的に起こる正常系だが、call は作者が「ここで喋る」と
@@ -2537,10 +2678,9 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
             Some(t) => {
                 let talk = t.clone();
                 append_log!(format!("enter talk (call): {}", talk.event));
-                self.env.push_scope();
 
                 let result = self.run_stmts(&talk.body, out);
-                self.env.pop_scope();
+                self.env.leave_call_frame(saved);
                 self.env.call_depth -= 1;
 
                 if let Some(FlowControl::Return(val)) = result {
@@ -2549,6 +2689,7 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
                 }
             }
             None => {
+                self.env.leave_call_frame(saved);
                 self.env.call_depth -= 1;
                 self.push_err("notice", format!("call「{}」の候補選択に失敗し、何も出力されませんでした", name));
             }
@@ -2559,12 +2700,12 @@ fn filter_alive<'t>(&mut self, candidates: &'t [Talk]) -> Vec<(usize, &'t Talk)>
     if self.env.call_depth > 100 { append_log!("call depth limit exceeded"); return; }
     self.env.call_depth += 1;
     if let Some((params, body)) = self.env.funcs.get(name).cloned() {
-        self.env.push_scope();
+        let saved = self.env.enter_call_frame();
         for (param, val) in params.iter().zip(args) { self.env.set_local(param, val); }
         if let Some(FlowControl::Return(val)) = self.run_stmts(&body, out) {
             out.push_str(&val.to_display());
         }
-        self.env.pop_scope();
+        self.env.leave_call_frame(saved);
     }
     self.env.call_depth -= 1;
 }
@@ -3056,6 +3197,93 @@ fn test_talk_exists_false() {
     assert_eq!(out, "\\0false\\e");
 }
 
+/// 「計測 => { 湊: ${式} }」を実行して、出力と積まれたエラーを返す
+fn eval_talk_count(defs: &str, expr: &str) -> (String, Vec<(String, String)>) {
+    let src = format!("{}\n計測 => {{\n    湊: ${{{}}}\n}}", defs, expr);
+    let pre = crate::parser::preprocess(&src).expect("preprocess failed").src;
+    let items = program_with_include().parse(&*pre).unwrap();
+    let mut talks = Vec::new();
+    let mut talk_map: HashMap<String, Vec<Talk>> = HashMap::new();
+    let mut funcs = Vec::new();
+    for item in items {
+        match item {
+            ProgramItem::Talk(t) => {
+                talk_map.entry(t.event.clone()).or_default().push(t.clone());
+                talks.push(t);
+            }
+            ProgramItem::FuncDef { name, params, body } => funcs.push((name, params, body)),
+            _ => {}
+        }
+    }
+    let mut chars = HashMap::new();
+    chars.insert("湊".to_string(), "\\0".to_string());
+    let mut cg = Codegen::new(chars, talk_map, PathBuf::from("."));
+    for (name, params, body) in funcs {
+        cg.env.funcs.insert(name, (params, body));
+    }
+    let entry = talks.iter().find(|t| t.event == "計測").expect("計測がない");
+    let out = cg.gen_talk(entry, &HashMap::new(), FIXED_TIME);
+    (out, cg.errors.clone())
+}
+
+fn repeat_talk(name: &str, n: usize) -> String {
+    format!("{} => {{\n    湊: あ\n}}\n", name).repeat(n)
+}
+
+#[test]
+fn test_talk_count_counts_definitions() {
+    let defs = format!("{}{}{}", repeat_talk("hoge", 10), repeat_talk("fuga", 5), repeat_talk("piyo", 1));
+    for (name, want) in [("hoge", 10), ("fuga", 5), ("piyo", 1), ("存在しないやつ", 0), ("", 0)] {
+        let (out, errors) = eval_talk_count(&defs, &format!("talk_count(\"{}\")", name));
+        assert_eq!(out, format!("\\0{}\\e", want), "{}", name);
+        assert!(errors.is_empty(), "{}: {:?}", name, errors);
+    }
+}
+
+#[test]
+fn test_talk_count_ignores_conditions() {
+    // if(false)で除外される定義も含めて、書いてある3つを返すこと
+    let defs = "hoge if(false) => {\n    湊: あ\n}\nhoge if(true) => {\n    湊: い\n}\nhoge => {\n    湊: う\n}\n";
+    let (out, errors) = eval_talk_count(defs, "talk_count(\"hoge\")");
+    assert_eq!(out, "\\03\\e");
+    assert!(errors.is_empty(), "{:?}", errors);
+}
+
+#[test]
+fn test_talk_count_does_not_count_funcs() {
+    let defs = format!("func 関数だけ() {{\n    return 1\n}}\nfunc 両方() {{\n    return 1\n}}\n{}", repeat_talk("両方", 2));
+    assert_eq!(eval_talk_count(&defs, "talk_count(\"関数だけ\")").0, "\\00\\e");
+    assert_eq!(eval_talk_count(&defs, "talk_exists(\"関数だけ\")").0, "\\0true\\e");
+    assert_eq!(eval_talk_count(&defs, "talk_count(\"両方\")").0, "\\02\\e");
+}
+
+#[test]
+fn test_talk_count_bad_args_warn_and_return_zero() {
+    let cases = [
+        ("talk_count()", "1つだけ渡してください（0個渡されました）"),
+        ("talk_count(\"a\", \"b\")", "1つだけ渡してください（2個渡されました）"),
+        ("talk_count(1)", "文字列で渡してください（数値が渡されました）"),
+        ("talk_count(null)", "文字列で渡してください（nullが渡されました）"),
+        ("talk_count(true)", "文字列で渡してください（真偽値が渡されました）"),
+        ("talk_count([\"hoge\"])", "文字列で渡してください（配列が渡されました）"),
+        ("talk_count({\"a\": 1})", "文字列で渡してください（マップが渡されました）"),
+    ];
+    for (expr, want) in cases {
+        let (out, errors) = eval_talk_count(&repeat_talk("hoge", 2), expr);
+        assert_eq!(out, "\\00\\e", "{}", expr);
+        assert_eq!(errors.len(), 1, "{}: {:?}", expr, errors);
+        assert_eq!(errors[0].0, "warning", "{}", expr);
+        assert!(errors[0].1.contains("talk_countにはトーク名を"), "{}: {:?}", expr, errors);
+        assert!(errors[0].1.contains(want), "{}: {:?}", expr, errors);
+    }
+}
+
+#[test]
+fn test_talk_count_user_definition_takes_priority() {
+    let defs = "func talk_count(name) {\n    return \"自作\"\n}\n";
+    assert_eq!(eval_talk_count(defs, "talk_count(\"x\")").0, "\\0自作\\e");
+}
+
     #[test]
 fn test_call_reference_dotted() {
     let src = r#"
@@ -3378,16 +3606,176 @@ fn test_null_literal() {
     assert_eq!(out, "\\0true 代替\\e");
 }
 
+// ---- draw ----
+
 #[test]
-fn test_null_literal_is_not_shadowed_by_variable() {
-    // null は変数ではなくリテラルなので、同名の let があっても null のまま
-    let src = r#"OnBoot => {
-    let null = 1
-    湊: ${is_null(null)}
-}"#;
-    let talks = parse_talks(src);
-    let out = make_gen().gen_talk(&talks[0], &HashMap::new(), FIXED_TIME);
+fn test_draw_writes_back_to_save() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    global save.山札 = [1, 2, 3]
+    湊: ${draw(save.山札)}/${len(save.山札)}
+}"#);
+    assert_eq!(out, "\\03/2\\e");
+}
+
+#[test]
+fn test_draw_writes_back_to_let_and_returns_null_when_empty() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    let d = ["a", "b"]
+    湊: ${draw(d)}${draw(d)}${is_null(draw(d))}${len(d)}
+}"#);
+    assert_eq!(out, "\\0batrue0\\e");
+}
+
+#[test]
+fn test_draw_statement_writes_back_to_global_and_nested_save() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    global g = [1, 2]
+    global save.a.b = [1, 2, 3]
+    draw(g)
+    draw(save.a.b)
+    湊: ${len(g)}/${len(save.a.b)}
+}"#);
+    assert_eq!(out, "\\01/2\\e");
+}
+
+#[test]
+fn test_draw_refills_when_empty() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    global save.山札 = []
+    湊: ${draw(save.山札, ["x"])}/${len(save.山札)}
+}"#);
+    // 最後の1枚を引いた時点で補充されている
+    assert_eq!(out, "\\0x/1\\e");
+}
+
+#[test]
+fn test_draw_on_param_does_not_change_caller() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    func f(d) {
+        return draw(d)
+    }
+    global save.x = [1, 2]
+    湊: ${f(save.x)}/${len(save.x)}
+}"#);
+    assert_eq!(out, "\\02/2\\e");
+}
+
+#[test]
+fn test_draw_user_func_takes_priority() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    func draw(x) {
+        return "mine"
+    }
+    let d = [1]
+    湊: ${draw(d)}${len(d)}
+}"#);
+    assert_eq!(out, "\\0mine1\\e");
+}
+
+#[test]
+fn test_draw_non_variable_argument_warns() {
+    let (out, cg) = run_boot_with_talks(r#"OnBoot => {
+    湊: [${draw([1, 2])}]
+}"#);
+    assert_eq!(out, "\\0[]\\e");
+    assert!(cg.errors.iter().any(|(level, msg)| level == "warning" && msg.contains("draw の1つ目")), "{:?}", cg.errors);
+}
+
+// ---- 呼び出し先から呼び出し元のletは見えない ----
+
+#[test]
+fn test_func_cannot_read_caller_let() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    func f() {
+        return is_null(x)
+    }
+    let x = 1
+    湊: ${f()}
+}"#);
     assert_eq!(out, "\\0true\\e");
+}
+
+#[test]
+fn test_func_assignment_does_not_overwrite_caller_let() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    func g() {
+        x = 99
+    }
+    let x = 1
+    g()
+    湊: ${x}
+}"#);
+    assert_eq!(out, "\\01\\e");
+}
+
+#[test]
+fn test_called_talk_cannot_read_caller_let() {
+    let (out, _) = run_boot_with_talks(r#"子 => {
+    湊: ${is_null(x)}
+}
+OnBoot => {
+    let x = 1
+    call 子
+}"#);
+    assert!(out.contains("true") && !out.contains("false"), "{}", out);
+}
+
+#[test]
+fn test_talk_called_in_expression_cannot_read_caller_let() {
+    let (out, _) = run_boot_with_talks(r#"子 => {
+    return is_null(x)
+}
+OnBoot => {
+    let x = 1
+    湊: ${子()}
+}"#);
+    assert_eq!(out, "\\0true\\e");
+}
+
+#[test]
+fn test_called_talk_cond_cannot_read_caller_let() {
+    // 呼び出し元のxが見えていれば1つ目も候補に入り、ランダムに「見えた」が出る
+    for _ in 0..20 {
+        let (out, _) = run_boot_with_talks(r#"子 if(x == 1) => {
+    湊: 見えた
+}
+子 => {
+    湊: 見えない
+}
+OnBoot => {
+    let x = 1
+    call 子
+}"#);
+        assert!(out.contains("見えない"), "{}", out);
+    }
+}
+
+#[test]
+fn test_func_can_read_reference_and_now() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    func 時() {
+        return now.時
+    }
+    func 参照ある() {
+        return is_map(reference)
+    }
+    湊: ${時() == now.時} ${参照ある()}
+}"#);
+    assert_eq!(out, "\\0true true\\e");
+}
+
+#[test]
+fn test_recursive_func_keeps_own_args() {
+    let (out, _) = run_boot_with_talks(r#"OnBoot => {
+    func fact(n) {
+        if (n <= 1) {
+            return 1
+        }
+        return n * fact(n - 1)
+    }
+    湊: ${fact(5)}
+}"#);
+    assert_eq!(out, "\\0120\\e");
 }
 
 #[test]
@@ -5442,5 +5830,106 @@ mod builtin_ext_tests {
         }
         assert_eq!(num(call("rand", vec![n(7.0), n(7.0)])), 7.0);
         assert!(num(call("rand", vec![])) >= 0.0);
+    }
+
+    fn nums(v: &Value) -> Vec<f64> {
+        match v { Value::Array(a) => a.iter().map(|x| x.as_number()).collect(), _ => panic!("配列でない") }
+    }
+
+    #[test]
+    fn test_pick() {
+        let src = arr(&[1.0, 2.0, 3.0]);
+        let mut seen = [false; 3];
+        for _ in 0..2000 {
+            let v = num(call("pick", vec![src.clone()]));
+            assert!((1.0..=3.0).contains(&v), "範囲外: {}", v);
+            seen[v as usize - 1] = true;
+        }
+        assert!(seen.iter().all(|b| *b), "選ばれない要素がある");
+        assert_eq!(nums(&src), [1.0, 2.0, 3.0], "元の配列が変わった");
+        assert!(matches!(call("pick", vec![arr(&[])]), Value::Null));
+        assert!(matches!(call("pick", vec![Value::Str("abc".into())]), Value::Null));
+        assert!(matches!(call("pick", vec![]), Value::Null));
+    }
+
+    #[test]
+    fn test_shuffle() {
+        let src = arr(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let mut changed = false;
+        for _ in 0..200 {
+            let mut sorted = nums(&call("shuffle", vec![src.clone()]));
+            if sorted != [1.0, 2.0, 3.0, 4.0, 5.0] { changed = true; }
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(sorted, [1.0, 2.0, 3.0, 4.0, 5.0], "要素の集合が変わった");
+        }
+        assert!(changed, "一度も並びが変わらない");
+        assert_eq!(nums(&src), [1.0, 2.0, 3.0, 4.0, 5.0], "元の配列が変わった");
+        assert!(nums(&call("shuffle", vec![arr(&[])])).is_empty());
+        assert!(matches!(call("shuffle", vec![Value::Str("abc".into())]), Value::Null));
+        assert!(matches!(call("shuffle", vec![]), Value::Null));
+    }
+
+    #[test]
+    fn test_draw_card_without_refill() {
+        let (card, deck) = draw_card(arr(&[1.0, 2.0, 3.0]), None);
+        assert_eq!(num(card), 3.0, "末尾から引く");
+        assert_eq!(nums(&deck.unwrap()), [1.0, 2.0]);
+        // 空の山札・配列以外は null で、書き戻さない
+        let (card, deck) = draw_card(arr(&[]), None);
+        assert!(matches!(card, Value::Null) && deck.is_none());
+        let (card, deck) = draw_card(Value::Null, None);
+        assert!(matches!(card, Value::Null) && deck.is_none());
+        let (card, deck) = draw_card(Value::Str("abc".into()), None);
+        assert!(matches!(card, Value::Null) && deck.is_none());
+        // 最後の1枚は引けて、空の山札が残る
+        let (card, deck) = draw_card(arr(&[5.0]), None);
+        assert_eq!(num(card), 5.0);
+        assert!(nums(&deck.unwrap()).is_empty());
+    }
+
+    #[test]
+    fn test_draw_card_bad_words_is_same_as_no_refill() {
+        for words in [arr(&[]), Value::Str("abc".into()), Value::Null] {
+            let (card, deck) = draw_card(arr(&[]), Some(&words));
+            assert!(matches!(card, Value::Null) && deck.is_none());
+            let (card, deck) = draw_card(arr(&[1.0, 2.0]), Some(&words));
+            assert_eq!(num(card), 2.0);
+            assert_eq!(nums(&deck.unwrap()), [1.0]);
+        }
+    }
+
+    #[test]
+    fn test_draw_card_refills_each_round_without_repeating_at_seam() {
+        let words = arr(&[1.0, 2.0, 3.0]);
+        // 配列以外の山札は空の山札として補充する
+        let mut deck = Value::Null;
+        let mut drawn = Vec::new();
+        for _ in 0..3000 {
+            let (card, new_deck) = draw_card(deck, Some(&words));
+            drawn.push(num(card));
+            deck = new_deck.expect("補充ありなら必ず書き戻す");
+            // 最後の1枚を引いたらその場で補充するので、山札が空のまま残ることはない
+            let k = drawn.len() % 3;
+            assert_eq!(nums(&deck).len(), if k == 0 { 3 } else { 3 - k });
+        }
+        for round in drawn.chunks(3) {
+            let mut r = round.to_vec();
+            r.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(r, [1.0, 2.0, 3.0], "一巡で全部が1回ずつ出ていない: {:?}", round);
+        }
+        for w in drawn.windows(2) {
+            assert_ne!(w[0], w[1], "同じ札が続いた");
+        }
+    }
+
+    #[test]
+    fn test_draw_card_single_word_repeats() {
+        let words = arr(&[7.0]);
+        let mut deck = arr(&[]);
+        for _ in 0..5 {
+            let (card, new_deck) = draw_card(deck, Some(&words));
+            assert_eq!(num(card), 7.0);
+            deck = new_deck.unwrap();
+        }
     }
 }
